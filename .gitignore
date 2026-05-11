@@ -1,0 +1,15 @@
+# Dados brutos INMET (3.5 GB - não versionar)
+BASE/
+
+# Executáveis locais
+ngrok.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# IDEs
+.vscode/
+.idea/
