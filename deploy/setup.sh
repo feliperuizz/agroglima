@@ -43,8 +43,8 @@ sudo systemctl enable --now agroclima
 sudo systemctl restart nginx
 
 echo "== 5/5 Firewall interno da imagem Oracle (portas 80 e 443)"
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 1 -p tcp --dport 443 -j ACCEPT
 sudo netfilter-persistent save
 
 echo

@@ -17,8 +17,9 @@ from pathlib import Path
 from typing import Annotated, Optional
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
@@ -67,6 +68,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="AgroClima API", version="1.1.0", lifespan=lifespan)
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -134,6 +136,8 @@ class RecommendResponse(BaseModel):
     diagnostico: str
     metodo: str
     periodo_dados: str
+    anos_usados: list[int]
+    n_anos_por_mes: dict[int, int]
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -706,6 +710,9 @@ def build_recommendation(req: RecommendRequest) -> RecommendResponse:
         diagnostico=diagnostico,
         metodo="Regra trapezoidal aplicada diretamente (AgroClima 1.1)",
         periodo_dados=periodo,
+        anos_usados=sorted(int(a) for a in _monthly.loc[_monthly["codigo"] == req.station_code, "year"].unique()),
+        n_anos_por_mes={int(r.month): int(r.n_anos)
+                        for r in _normals[_normals["codigo"] == req.station_code].itertuples()},
     )
 
 
@@ -740,9 +747,39 @@ async def get_stations(uf: Optional[str] = None, search: Optional[str] = None):
 async def get_crops():
     """Lista as culturas disponíveis."""
     return [
-        {"key": k, "nome": v["nome"], "emoji": v["emoji"], "desc": v["desc"]}
+        {"key": k, "nome": v["nome"], "emoji": v["emoji"], "desc": v["desc"],
+         "temp": v["temp"], "precip": v["precip"], "umidade": v["umidade"],
+         "meses_favoraveis": v["meses_favoraveis"]}
         for k, v in CROP_REQUIREMENTS.items()
     ]
+
+
+def fator_limitante(b: dict) -> str:
+    """Variável com a menor nota parcial; 'nenhum' quando todas estão na faixa ótima."""
+    notas = {"temperatura": b["s_temp"], "chuva": b["s_precip"], "umidade": b["s_umid"]}
+    nome, nota = min(notas.items(), key=lambda kv: kv[1])
+    return "nenhum" if nota >= 1.0 else nome
+
+
+@app.get("/api/map")
+async def get_map(crop: str, month: Annotated[int, Query(ge=1, le=12)]):
+    """Pontuação de todas as estações com indicador local para uma cultura e um mês (mapa)."""
+    if crop not in CROP_REQUIREMENTS:
+        raise HTTPException(400, f"Cultura '{crop}' não suportada.")
+    rows = _normals[_normals["month"] == month]
+    out = []
+    for r in rows.itertuples(index=False):
+        b = score_breakdown(r._asdict(), crop)
+        out.append({
+            "codigo": r.codigo, "nome": r.nome, "uf": r.uf,
+            "lat": round(float(r.lat), 4), "lon": round(float(r.lon), 4),
+            "score": b["score"], "inviavel": b["veto"], "n_anos": int(r.n_anos),
+            "s_temp": round(b["s_temp"], 3), "s_precip": round(b["s_precip"], 3), "s_umid": round(b["s_umid"], 3),
+            "limitante": fator_limitante(b),
+            "temp": round(float(r.temp_norm), 1), "precip": round(float(r.precip_norm), 1),
+            "umidade": round(float(r.umidade_norm), 1),
+        })
+    return out
 
 
 @app.get("/api/climate/{station_code}")

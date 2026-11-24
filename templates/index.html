@@ -6,6 +6,8 @@
   <title>AgroClima — Inteligência para o Campo</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Playfair+Display:wght@700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <style>
@@ -304,6 +306,29 @@
     .log-inner::-webkit-scrollbar { width: 5px; }
     .log-inner::-webkit-scrollbar-thumb { background: #2a2a2a; }
 
+    /* ── Mapa ── */
+    #map { height: 480px; border-radius: 12px; background: #0a0f0a; }
+    .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #0d1a10; color: #e7f5e9; border: 1px solid rgba(34,197,94,.3); }
+    .leaflet-popup-content { font-family: 'Inter', sans-serif; font-size: .8rem; }
+    .leaflet-container a.leaflet-popup-close-button { color: #86efac; }
+    .map-legend span { display:inline-flex; align-items:center; gap:6px; margin-right:14px; }
+    .map-legend i { width:10px; height:10px; border-radius:50%; display:inline-block; }
+
+    /* ── Rótulos do mapa: siglas das UFs e nomes das cidades ── */
+    .uf-label { color: rgba(231,245,233,.55); font: 800 13px 'Inter', sans-serif; letter-spacing: .06em;
+                text-shadow: 0 0 4px #0a0f0a, 0 0 8px #0a0f0a; white-space: nowrap; pointer-events: none;
+                transform: translate(-50%, -50%); transition: font-size .2s, color .2s; }
+    .zoom-perto .uf-label { font-size: 22px; color: rgba(231,245,233,.18); }
+    .st-label { color: #e7f5e9; font: 600 10.5px 'Inter', sans-serif; white-space: nowrap; pointer-events: none;
+                text-shadow: 0 0 3px #0a0f0a, 0 0 6px #0a0f0a, 0 0 2px #0a0f0a; transform: translate(8px, -50%); }
+    .zoom-muito-perto .st-label { font-size: 12px; }
+
+    /* ── Cartão de mês clicável e modal de explicação ── */
+    .month-card.clicavel { cursor: pointer; }
+    .month-card.clicavel:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,.35); }
+    .spinner-sm { width:16px; height:16px; border:2px solid rgba(255,255,255,.35); border-top-color:#fff;
+                  border-radius:50%; display:inline-block; animation: spin .7s linear infinite; vertical-align:-3px; }
+
     /* ── Scrollbar global ── */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: #0a0f0a; }
@@ -343,7 +368,7 @@
       <img src="/static/agroclimalogo.png" alt="AgroClima" class="h-10 w-auto" />
     </div>
     <div class="hidden md:flex gap-8 text-sm text-green-200/70 font-medium">
-      <a href="#sistema" class="hover:text-green-300 transition-colors">Sistema</a>
+      <a href="#mapa" class="hover:text-green-300 transition-colors">Mapa</a>
       <a href="#analise"  class="hover:text-green-300 transition-colors">Análise</a>
       <a href="#sobre"    class="hover:text-green-300 transition-colors">Sobre</a>
     </div>
@@ -462,6 +487,29 @@
 <!-- ═══════════════════════════════════════════════
      FORMULÁRIO DE ANÁLISE
 ═══════════════════════════════════════════════ -->
+<section id="mapa" class="bg-[#0b150d] py-20 px-6">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-10">
+      <span class="text-xs font-bold text-green-500 uppercase tracking-widest">Panorama</span>
+      <h2 class="text-3xl md:text-4xl font-black text-white mt-2">Mapa de adequação climática</h2>
+      <p class="text-green-200/60 mt-3 text-base">Pontuação histórica de cada estação do INMET para a cultura e o mês escolhidos. Clique numa estação para analisá-la.</p>
+    </div>
+    <div class="glass-card p-4 md:p-6">
+      <div class="flex flex-wrap items-center gap-3 mb-4">
+        <select id="map-crop" class="inp" style="width:auto" onchange="loadMap()"></select>
+        <select id="map-month" class="inp" style="width:auto" onchange="loadMap()"></select>
+        <select id="map-mode" class="inp" style="width:auto" onchange="loadMap()">
+          <option value="score">Colorir por: pontuação</option>
+          <option value="fator">Colorir por: fator que mais limita</option>
+        </select>
+        <span id="map-info" class="text-xs text-green-200/60"></span>
+      </div>
+      <div id="map"></div>
+      <div id="map-legend" class="map-legend mt-4 text-xs text-green-200/70"></div>
+    </div>
+  </div>
+</section>
+
 <section id="analise" class="bg-[#080f09] py-20 px-6">
   <div class="max-w-5xl mx-auto">
     <div class="text-center mb-12">
@@ -536,6 +584,7 @@
           <div class="text-xs font-bold text-green-500 uppercase tracking-widest mb-1">Resultado da Análise</div>
           <h2 class="text-2xl md:text-3xl font-black text-white" id="res-title">—</h2>
           <p class="text-green-200/60 mt-1 text-sm" id="res-subtitle">—</p>
+          <p class="mt-3 text-sm leading-relaxed text-green-100/85 max-w-2xl" id="res-resumo"></p>
         </div>
         <!-- Gauge SVG -->
         <div class="flex-shrink-0 flex flex-col items-center">
@@ -559,6 +608,13 @@
         <ul id="res-alert-text" class="space-y-1 list-none"></ul>
       </div>
 
+      <!-- Escopo -->
+      <div class="mt-4 text-xs text-green-200/60 border border-white/10 rounded-lg p-3 leading-relaxed">
+        ℹ️ Pontuação histórica de adequação climática (0 a 100), calculada pela regra trapezoidal com médias mensais da estação.
+        Não é probabilidade de sucesso nem data de semeadura, e não substitui o
+        <a href="https://www.gov.br/agricultura/pt-br/assuntos/riscos-seguro/programa-nacional-de-zoneamento-agricola-de-risco-climatico" target="_blank" rel="noopener" class="text-green-400 hover:underline">Zoneamento Agrícola de Risco Climático (ZARC)</a>.
+      </div>
+
       <!-- Best months -->
       <div id="res-best" class="mt-4 hidden">
         <span class="text-xs text-green-400 font-semibold uppercase tracking-wider">Melhores meses do ano:</span>
@@ -568,9 +624,20 @@
 
     <!-- Meses individuais -->
     <div class="mb-6">
-      <h3 class="text-lg font-bold text-white mb-4">Análise por Mês</h3>
+      <h3 class="text-lg font-bold text-white mb-1">Análise por Mês</h3>
+      <div class="glass-card p-4 mb-4 text-xs text-green-200/75" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px">
+        <div><b style="color:#f97316">🌡 Temperatura</b> · peso 35%<br>média do mês contra a faixa ótima da cultura</div>
+        <div><b style="color:#38bdf8">🌧 Chuva</b> · peso 40%<br>total do mês; maior peso, pois a seca domina as perdas</div>
+        <div><b style="color:#c084fc">💧 Umidade</b> · peso 25%<br>umidade relativa média do mês</div>
+        <div><b style="color:#e7f5e9">Barras = nota de 0 a 1</b><br><span style="color:#22c55e">■</span> ótima
+          <span style="color:#eab308">■</span> atenção <span style="color:#ef4444">■</span> fora do limite</div>
+      </div>
+      <p class="text-xs text-green-200/50 mb-4">Clique num mês para ver o cálculo completo.</p>
       <div id="months-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3 slide-up"></div>
     </div>
+
+    <!-- Transparência dos dados -->
+    <div id="data-card" class="glass-card p-6 mb-6"></div>
 
     <!-- Gráficos -->
     <div class="grid md:grid-cols-2 gap-6 mb-6">
@@ -648,53 +715,20 @@
   </div>
 </section>
 
-<!-- ═══ TERMINAL REAL (fullscreen) ═══ -->
-<div id="terminal-overlay" class="terminal-overlay hidden">
-
-  <!-- Barra de título estilo macOS/Windows -->
-  <div class="term-titlebar">
-    <div class="term-dot" style="background:#ff5f57"></div>
-    <div class="term-dot" style="background:#febc2e"></div>
-    <div class="term-dot" style="background:#28c840"></div>
-    <div class="term-titlebar-text">bash — agroclima-ml — 120×40</div>
-    <div class="term-titlebar-right" id="term-elapsed">00:00</div>
-  </div>
-
-  <!-- Área do terminal -->
-  <div class="term-screen" id="term-body"></div>
-
-  <!-- Status bar estilo VS Code -->
-  <div class="term-statusbar">
-    <span>⎇ main</span>
-    <span id="term-sb-step">Aguardando...</span>
-    <div class="term-sb-right">
-      <div style="display:flex;align-items:center;gap:8px">
-        <div class="term-progbar-wrap">
-          <div class="term-progbar-fill" id="term-prog-fill" style="width:0%"></div>
-        </div>
-        <span id="term-prog-pct">0%</span>
+<!-- Modal: explicar a nota -->
+<div id="exp-overlay" class="lit-overlay hidden" onclick="if(event.target===this) closeExplain()">
+  <div class="lit-modal fade-in">
+    <div class="lit-header">
+      <div>
+        <div class="text-xs font-bold text-green-400 uppercase tracking-widest mb-1">Como a nota foi calculada</div>
+        <h2 class="text-xl font-black text-white" id="exp-title">—</h2>
+        <p class="text-sm text-green-200/50 mt-0.5" id="exp-sub"></p>
       </div>
-      <span>UTF-8</span>
-      <span>Python 3.11</span>
+      <button onclick="closeExplain()" class="w-9 h-9 rounded-lg flex items-center justify-center text-green-400/60 hover:text-white hover:bg-white/10 transition-all text-xl font-light">✕</button>
     </div>
+    <div class="lit-body" id="exp-body"></div>
   </div>
 </div>
-
-<!-- ═══ LOG PERSISTENTE (fica abaixo dos resultados) ═══ -->
-<section id="log-section" class="log-section hidden">
-  <div class="log-header" onclick="toggleLog()">
-    <span style="font-family:'JetBrains Mono',monospace;font-size:.7rem;color:#22c55e">▸</span>
-    <span style="font-family:'JetBrains Mono',monospace;font-size:.72rem;color:#888">
-      TERMINAL — Log de processamento da última análise
-    </span>
-    <span id="log-toggle-icon" style="font-family:'JetBrains Mono',monospace;font-size:.68rem;color:#555;margin-left:auto">
-      [expandir]
-    </span>
-  </div>
-  <div class="log-body" id="log-body">
-    <div class="log-inner" id="log-inner"></div>
-  </div>
-</section>
 
 <!-- Error toast -->
 <div id="toast" class="fixed bottom-6 right-6 z-50 glass-card border-red-600/50 px-5 py-4 text-sm text-red-300 hidden fade-in max-w-sm">
@@ -762,6 +796,7 @@ let allStations = [], allCrops = [], selectedCrop = null;
 async function init() {
   await Promise.all([loadStats(), loadStations(), loadCrops()]);
   buildMonthGrid();
+  initMap();
 }
 
 async function loadStats() {
@@ -1262,196 +1297,10 @@ function renderLitCrop(key) {
     </div>`;
 }
 
-// ── Terminal ──────────────────────────────────────────────────────────────────
-const STEP_PCT = {
-  init:15, station:30, records:45, crop:60,
-  complete:97, result:100, error:100,
-};
+// ── Análise ───────────────────────────────────────────────────────────────────
+let _lastResult = null;
 
-let _termTimer   = null;
-let _termStart   = 0;
-let _termMonths  = 0;
-let _termMDone   = 0;
-let _logLines    = [];   // cópia de tudo que foi exibido
-
-function termOpen(totalMonths, stationCode, cropKey, monthsList) {
-  _termMonths = totalMonths;
-  _termMDone  = 0;
-  _logLines   = [];
-  document.getElementById('term-body').innerHTML = '';
-  termProg(0, 'Aguardando...');
-  document.getElementById('terminal-overlay').classList.remove('hidden');
-  _termStart = Date.now();
-
-  // atualiza relógio no titlebar
-  _termTimer = setInterval(() => {
-    const s = (Date.now() - _termStart) / 1000;
-    const mm = String(Math.floor(s / 60)).padStart(2,'0');
-    const ss = String(Math.floor(s % 60)).padStart(2,'0');
-    document.getElementById('term-elapsed').textContent = mm + ':' + ss;
-  }, 200);
-
-  // prompt inicial
-  const crop  = allCrops.find(c => c.key === cropKey);
-  const mStr  = monthsList.map(m => MONTHS[m]).join(',');
-  termRaw('tl-prompt',
-    `user@agroclima:~$ python analyze.py \\`);
-  termRaw('tl-prompt',
-    `    --estacao ${stationCode} --cultura ${cropKey} --meses ${mStr}`);
-  termBlank();
-}
-
-function termClose() {
-  document.getElementById('terminal-overlay').classList.add('hidden');
-  clearInterval(_termTimer);
-}
-
-function termProg(pct, stepLabel) {
-  document.getElementById('term-prog-fill').style.width = pct + '%';
-  document.getElementById('term-prog-pct').textContent  = pct + '%';
-  document.getElementById('term-sb-step').textContent   = stepLabel;
-}
-
-/* adiciona uma linha simples com classe de cor */
-function termRaw(cls, text) {
-  const body = document.getElementById('term-body');
-  body.querySelectorAll('.tl-cursor').forEach(el => el.classList.remove('tl-cursor'));
-  const div = document.createElement('div');
-  div.className = `tl ${cls} tl-cursor`;
-  div.textContent = text;
-  body.appendChild(div);
-  body.scrollTop = body.scrollHeight;
-  _logLines.push({ cls, text });
-}
-
-function termBlank() {
-  const body = document.getElementById('term-body');
-  const div = document.createElement('div');
-  div.className = 'tl tl-blank';
-  body.appendChild(div);
-  _logLines.push({ cls: 'tl-blank', text: '' });
-}
-
-/* mapa de como cada step vira linhas no terminal */
-function termPrint(step, msg, detail) {
-  const ts = termTimestamp();
-
-  switch(step) {
-    case 'init':
-      termRaw('tl-run',  `${ts}  ${msg}`);
-      if (detail) termRaw('tl-sub', `       ${detail}`);
-      break;
-
-    case 'station':
-      termRaw('tl-ok',  `${ts}  ✔  ${msg}`);
-      if (detail) termRaw('tl-sub', `       └─ ${detail}`);
-      break;
-
-    case 'loading':
-      termBlank();
-      termRaw('tl-run',  `${ts}  ${msg}`);
-      if (detail) termRaw('tl-sub', `       ${detail}`);
-      break;
-
-    case 'records':
-      termRaw('tl-ok',  `${ts}  ✔  ${msg}`);
-      if (detail) termRaw('tl-sub', `       └─ ${detail}`);
-      break;
-
-    case 'normals_calc':
-      termBlank();
-      termRaw('tl-run',  `${ts}  ${msg}`);
-      break;
-
-    case 'normals_done':
-      termRaw('tl-ok',  `${ts}  ✔  ${msg}`);
-      if (detail) termRaw('tl-sub', `       └─ ${detail}`);
-      break;
-
-    case 'crop':
-      termBlank();
-      termRaw('tl-ok',  `${ts}  ✔  ${msg}`);
-      if (detail) termRaw('tl-sub', `       └─ ${detail}`);
-      break;
-
-    case 'crop_req':
-      termRaw('tl-ok',  `${ts}  ✔  ${msg}`);
-      if (detail) termRaw('tl-sub', `       └─ ${detail}`);
-      break;
-
-    case 'ml_init':
-      termBlank();
-      termRaw('tl-run',  `${ts}  ${msg}`);
-      if (detail) termRaw('tl-sub', `       ${detail}`);
-      break;
-
-    case 'ml_features':
-      termRaw('tl-run',  `${ts}  ${msg}`);
-      if (detail) termRaw('tl-sub', `       [ ${detail} ]`);
-      break;
-
-    case 'rule_month':
-      termRaw('tl-ml',  `${ts}  ›  ${msg}`);
-      if (detail) termRaw('tl-sub', `       ${detail}`);
-      break;
-
-    case 'scoring':
-      termBlank();
-      termRaw('tl-run',  `${ts}  ${msg}`);
-      if (detail) termRaw('tl-sub', `       ${detail}`);
-      break;
-
-    case 'complete':
-      termBlank();
-      termRaw('tl-done', `${ts}  ★  ${msg}`);
-      if (detail) termRaw('tl-sub', `       ${detail}`);
-      termBlank();
-      break;
-
-    case 'result':
-      termRaw('tl-ok',  `${ts}  ✔  Resultado transmitido ao dashboard`);
-      termBlank();
-      termRaw('tl-prompt', `user@agroclima:~$ _`);
-      break;
-
-    case 'error':
-      termBlank();
-      termRaw('tl-err',  `${ts}  ✖  ERRO: ${msg}`);
-      if (detail) termRaw('tl-sub', `       ${detail}`);
-      termBlank();
-      break;
-  }
-}
-
-function termTimestamp() {
-  const s = (Date.now() - _termStart) / 1000;
-  const mm = String(Math.floor(s / 60)).padStart(2,'0');
-  const ss = (s % 60).toFixed(1).padStart(4,'0');
-  return `[${mm}:${ss}]`;
-}
-
-/* constrói o log persistente abaixo dos resultados */
-function buildLog() {
-  const inner = document.getElementById('log-inner');
-  inner.innerHTML = '';
-  _logLines.forEach(({ cls, text }) => {
-    const d = document.createElement('div');
-    d.className = `tl ${cls}`;
-    d.style.fontSize = '.72rem';
-    d.textContent = text;
-    inner.appendChild(d);
-  });
-}
-
-function toggleLog() {
-  const body = document.getElementById('log-body');
-  const icon = document.getElementById('log-toggle-icon');
-  const open = body.classList.toggle('open');
-  icon.textContent = open ? '[recolher]' : '[expandir]';
-}
-
-// ── Análise via SSE ───────────────────────────────────────────────────────────
-function analyze() {
+async function analyze() {
   const station = document.getElementById('sel-station').value;
   if (!station)      return showToast('Selecione uma estação meteorológica.');
   if (!selectedCrop) return showToast('Selecione uma cultura agrícola.');
@@ -1463,64 +1312,377 @@ function analyze() {
   if (months.length === 0) return showToast('Selecione pelo menos um mês.');
 
   const btn = document.getElementById('btn-analyze');
+  const label = btn.innerHTML;
   btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-sm"></span> Calculando...';
+  try {
+    const r = await fetchJSON('/api/recommend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ station_code: station, crop: selectedCrop, months }),
+    });
+    _lastResult = r;
+    renderResult(r);
+    document.getElementById('resultado').classList.remove('hidden');
+    document.getElementById('resultado').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    showToast(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = label;
+  }
+}
 
-  termOpen(months.length, station, selectedCrop, months);
+// ── Fatores analisados (leitura rápida) ───────────────────────────────────────
+const FATORES = {
+  temperatura: { icone: '🌡', nome: 'Temperatura', cor: '#f97316', peso: '35%', campo: 'temp_media', nota: 's_temp', lim: 'temp', un: '°C' },
+  chuva:       { icone: '🌧', nome: 'Chuva',       cor: '#38bdf8', peso: '40%', campo: 'precip_total', nota: 's_precip', lim: 'precip', un: 'mm' },
+  umidade:     { icone: '💧', nome: 'Umidade',     cor: '#c084fc', peso: '25%', campo: 'umidade_media', nota: 's_umid', lim: 'umidade', un: '%' },
+};
 
-  const url = `/api/recommend/stream?station_code=${encodeURIComponent(station)}&crop=${encodeURIComponent(selectedCrop)}&months=${months.join(',')}`;
-  const es  = new EventSource(url);
-  let monthCount = 0;
+function zonaCor(s) { return s >= 1 ? '#22c55e' : s <= 0 ? '#ef4444' : '#eab308'; }
 
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
-    const { step, msg, detail, data, result } = d;
+// Variável de menor nota no mês e se ela está abaixo ou acima da faixa ótima
+function limitanteMes(m, crop) {
+  let pior = null;
+  for (const [k, f] of Object.entries(FATORES)) {
+    const s = m.details[f.nota];
+    if (pior === null || s < pior.s) pior = { k, s };
+  }
+  if (pior.s >= 1) return null;
+  const f = FATORES[pior.k];
+  const [a, b, c, d] = crop[f.lim];
+  const x = m[f.campo];
+  const lado = x < b ? 'abaixo' : 'acima';
+  return { ...f, k: pior.k, s: pior.s, x, lado, otimo: `${b}–${c} ${f.un}`, fora: x <= a || x >= d };
+}
 
-    // ── progresso na statusbar ──────────────────────────────────
-    if (step === 'rule_month') {
-      monthCount++;
-      const pct = Math.round(60 + (monthCount / _termMonths) * 35);
-      termProg(pct, `Pontuando ${MONTHS_FULL[data?.month] || ''}...`);
-    } else if (STEP_PCT[step] !== undefined) {
-      const labels = {
-        init:'Motor iniciando...', station:'Estação localizada',
-        records:'Indicadores carregados', crop:'Requisitos da cultura',
-        complete:'Análise concluída', result:'Enviando resultado...', error:'Erro',
-      };
-      termProg(STEP_PCT[step], labels[step] || msg.slice(0,40));
-    }
+function fatorBars(m) {
+  return Object.values(FATORES).map(f => {
+    const s = m.details[f.nota];
+    return `
+      <div style="display:flex;align-items:center;gap:6px;font-size:.7rem;color:rgba(231,245,233,.75)">
+        <span style="width:14px">${f.icone}</span>
+        <span style="width:52px">${fmtBR(m[f.campo], f.un === 'mm' ? 0 : 1)} ${f.un}</span>
+        <div style="flex:1;height:6px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden">
+          <div style="height:100%;width:${Math.max(s * 100, 3)}%;background:${zonaCor(s)}"></div>
+        </div>
+        <span style="width:30px;text-align:right;color:${zonaCor(s)}">${fmtBR(s, 2)}</span>
+      </div>`;
+  }).join('');
+}
 
-    termPrint(step, msg, detail || '');
+function chipLimitante(lim) {
+  if (!lim) return `<div style="margin-top:8px;font-size:.68rem;color:#86efac">✓ todas as variáveis na faixa ótima</div>`;
+  return `<div style="margin-top:8px;font-size:.68rem;padding:3px 8px;border-radius:6px;display:inline-block;
+      background:${lim.fora ? 'rgba(239,68,68,.15)' : 'rgba(234,179,8,.12)'};color:${lim.fora ? '#fca5a5' : '#fde047'}">
+      ${lim.icone} ${lim.fora ? 'Fora do limite' : 'Limitou'}: ${lim.nome.toLowerCase()} ${lim.lado} do ideal</div>`;
+}
 
-    // ── estados finais ──────────────────────────────────────────
-    if (step === 'error') {
-      es.close(); btn.disabled = false;
-      setTimeout(termClose, 4000);
-      showToast(msg);
-      return;
-    }
+function renderResumo(r) {
+  const crop = allCrops.find(c => c.key === r.crop);
+  const pont = r.months.filter(m => m.score !== null);
+  const el = document.getElementById('res-resumo');
+  if (!pont.length) { el.innerHTML = ''; return; }
+  const melhor = pont.reduce((a, b) => (b.score > a.score ? b : a));
+  const frases = [`<b style="color:#fff">${melhor.month_name}</b> é o melhor mês selecionado (${fmtBR(melhor.score, 1)} pontos).`];
+  const porFator = {};
+  pont.forEach(m => {
+    const lim = limitanteMes(m, crop);
+    if (lim) (porFator[`${lim.nome.toLowerCase()} ${lim.lado} do ideal (ótimo ${lim.otimo})`] ||= []).push(m.month_name);
+  });
+  for (const [motivo, meses] of Object.entries(porFator)) {
+    const nomes = meses.length > 1 ? meses.slice(0, -1).join(', ') + ' e ' + meses.at(-1) : meses[0];
+    frases.push(`${nomes} ${meses.length > 1 ? 'perdem' : 'perde'} pontos principalmente por <b style="color:#fff">${motivo}</b>.`);
+  }
+  if (!Object.keys(porFator).length) frases.push('Todas as variáveis ficaram na faixa ótima nos meses selecionados.');
+  el.innerHTML = `<span style="color:#4ade80;font-weight:700">Em resumo:</span> ${frases.join(' ')}`;
+}
 
-    if (step === 'result') {
-      es.close(); btn.disabled = false;
-      buildLog();                                   // salva o log
+// ── Mapa ──────────────────────────────────────────────────────────────────────
+let _map = null, _mapLayer = null, _labelLayer = null;
+const ZOOM_NOMES = 6;
+// Divisas municipais (malha do IBGE), carregadas por estado só quando o zoom está próximo
+const ZOOM_MUNICIPIOS = 5.5;
+let _munLayer = null, _munRenderer = null;
+const _ufBounds = {}, _munCarregados = {};
 
-      setTimeout(() => {
-        termClose();
-        renderResult(result);
+function atualizarMunicipios() {
+  if (!_munLayer) return;
+  const z = _map.getZoom();
+  if (z < ZOOM_MUNICIPIOS) {
+    if (_map.hasLayer(_munLayer)) _map.removeLayer(_munLayer);
+    return;
+  }
+  if (!_map.hasLayer(_munLayer)) _munLayer.addTo(_map);
+  const vista = _map.getBounds();
+  for (const [uf, bounds] of Object.entries(_ufBounds)) {
+    if (_munCarregados[uf] || !vista.intersects(bounds)) continue;
+    _munCarregados[uf] = 'carregando';
+    fetch(`/static/municipios/${uf}.geojson`).then(r => r.json()).then(geo => {
+      L.geoJSON(geo, {
+        renderer: _munRenderer, interactive: false,
+        style: { color: '#5a9a6e', weight: .7, opacity: .55, fill: false },
+      }).addTo(_munLayer);
+      _munCarregados[uf] = true;
+    }).catch(() => { delete _munCarregados[uf]; });
+  }
+}
 
-        // mostra seção de log abaixo dos resultados
-        document.getElementById('log-section').classList.remove('hidden');
+// "VILA BELA DA SANTISSIMA TRINDADE" -> "Vila Bela da Santissima Trindade"
+function nomeCidade(n) {
+  const minus = new Set(['da', 'de', 'do', 'das', 'dos', 'e']);
+  return n.toLowerCase().split(' ').map((w, i) =>
+    (i > 0 && minus.has(w)) ? w : w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
 
-        document.getElementById('resultado').classList.remove('hidden');
-        document.getElementById('resultado').scrollIntoView({ behavior:'smooth', block:'start' });
-      }, 700);
-    }
-  };
+// Mostra os nomes das cidades só com zoom próximo e ajusta o tamanho das siglas
+function atualizarRotulos() {
+  const z = _map.getZoom();
+  const cont = _map.getContainer();
+  cont.classList.toggle('zoom-perto', z >= ZOOM_NOMES);
+  cont.classList.toggle('zoom-muito-perto', z >= ZOOM_NOMES + 1.5);
+  if (z >= ZOOM_NOMES) { if (!_map.hasLayer(_labelLayer)) _labelLayer.addTo(_map); }
+  else if (_map.hasLayer(_labelLayer)) _map.removeLayer(_labelLayer);
+}
+const COR_FATOR = { temperatura: '#f97316', chuva: '#38bdf8', umidade: '#c084fc', nenhum: '#22c55e' };
 
-  es.onerror = () => {
-    es.close(); btn.disabled = false;
-    termClose();
-    showToast('Conexão interrompida. Tente novamente.');
-  };
+function initMap() {
+  if (typeof L === 'undefined') return;
+  document.getElementById('map-crop').innerHTML =
+    allCrops.map(c => `<option value="${c.key}">${c.emoji} ${c.nome}</option>`).join('');
+  const selMonth = document.getElementById('map-month');
+  selMonth.innerHTML = MONTHS_FULL.slice(1).map((n, i) => `<option value="${i + 1}">${n}</option>`).join('');
+  selMonth.value = 10;
+
+  const brasil = [[-34.5, -74.5], [5.8, -34.0]];
+  _map = L.map('map', { preferCanvas: true, scrollWheelZoom: true, wheelPxPerZoomLevel: 120, zoomSnap: 0.25,
+                        maxBounds: [[-40, -85], [12, -25]], minZoom: 3 });
+  _map.fitBounds(brasil);
+  L.tileLayer('https://{s}.basemap.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 10,
+  }).addTo(_map);
+  fetch('/static/br_estados.geojson').then(r => r.json()).then(geo => {
+    L.geoJSON(geo, {
+      style: { color: '#4b7a5a', weight: 1, fillColor: '#12261a', fillOpacity: .55 },
+      interactive: false,
+    }).addTo(_map).bringToBack();
+    // Sigla de cada estado no centro do seu maior polígono
+    geo.features.forEach(f => {
+      _ufBounds[f.properties.sigla] = L.geoJSON(f).getBounds();
+      const maior = f.geometry.coordinates.reduce((a, b) => (b[0].length > a[0].length ? b : a));
+      const centro = L.polygon(maior[0].map(([x, y]) => [y, x])).getBounds().getCenter();
+      const ajuste = { GO: [-1.2, 0.6], DF: [0, 0], RJ: [-0.25, 0.3], ES: [0, 0.3], SE: [0, 0.15], AL: [0, 0.2],
+                       PB: [0, 0.6], RN: [0, 0.4], PE: [0, 0.6], PI: [-0.8, 0], MA: [-0.6, -0.4], PA: [-0.6, 0],
+                       AM: [0, -0.8], MG: [-0.6, -0.6], BA: [-0.8, 0.4], SC: [0, -0.4] }[f.properties.sigla] || [0, 0];
+      L.marker([centro.lat + ajuste[0], centro.lng + ajuste[1]], {
+        interactive: false, keyboard: false,
+        icon: L.divIcon({ className: '', html: `<div class="uf-label">${f.properties.sigla}</div>`, iconSize: [0, 0] }),
+      }).addTo(_map);
+    });
+  }).catch(() => {});
+  _mapLayer = L.layerGroup().addTo(_map);
+  _labelLayer = L.layerGroup();
+  _map.createPane('municipios').style.zIndex = 350;
+  _munRenderer = L.canvas({ pane: 'municipios' });
+  _munLayer = L.layerGroup();
+  _map.on('zoomend', atualizarRotulos);
+  _map.on('zoomend moveend', atualizarMunicipios);
+  loadMap();
+}
+
+function mapLegend(modo, data) {
+  const el = document.getElementById('map-legend');
+  if (modo === 'fator') {
+    const cont = { temperatura: 0, chuva: 0, umidade: 0, nenhum: 0 };
+    data.forEach(s => cont[s.limitante]++);
+    el.innerHTML = `
+      <span><i style="background:${COR_FATOR.chuva}"></i>🌧 chuva limita (${cont.chuva})</span>
+      <span><i style="background:${COR_FATOR.temperatura}"></i>🌡 temperatura limita (${cont.temperatura})</span>
+      <span><i style="background:${COR_FATOR.umidade}"></i>💧 umidade limita (${cont.umidade})</span>
+      <span><i style="background:${COR_FATOR.nenhum}"></i>✓ nada limita (${cont.nenhum})</span>
+      <div style="margin-top:6px;color:#9ca3af">Cor = variável com a menor nota parcial na estação. Contorno tracejado = fora do limite absoluto (inviável).</div>`;
+  } else {
+    el.innerHTML = `
+      <span><i style="background:#22c55e"></i>≥ 80</span><span><i style="background:#84cc16"></i>65–79</span>
+      <span><i style="background:#eab308"></i>50–64</span><span><i style="background:#f97316"></i>35–49</span>
+      <span><i style="background:#ef4444"></i>&lt; 35</span>
+      <span><i style="background:transparent;border:2px dashed #ef4444"></i>inviável (variável fora do limite absoluto)</span>
+      <div style="margin-top:6px;color:#6b7280">Aproxime o zoom para ver as divisas municipais (malha do IBGE) e os nomes das cidades.</div>`;
+  }
+}
+
+function barraPopup(icone, nome, x, un, s) {
+  return `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">
+    <span style="width:84px">${icone} ${nome}</span><span style="width:58px;color:#e7f5e9">${fmtBR(x, 1)} ${un}</span>
+    <span style="flex:1;height:6px;background:rgba(255,255,255,.1);border-radius:3px;overflow:hidden;min-width:60px">
+      <span style="display:block;height:100%;width:${Math.max(s * 100, 3)}%;background:${zonaCor(s)}"></span></span>
+    <span style="width:30px;text-align:right;color:${zonaCor(s)}">${fmtBR(s, 2)}</span></div>`;
+}
+
+async function loadMap() {
+  if (!_map) return;
+  const crop = document.getElementById('map-crop').value;
+  const month = +document.getElementById('map-month').value;
+  const modo = document.getElementById('map-mode').value;
+  const info = document.getElementById('map-info');
+  info.textContent = 'Carregando...';
+  try {
+    const data = await fetchJSON(`/api/map?crop=${crop}&month=${month}`);
+    _mapLayer.clearLayers();
+    _labelLayer.clearLayers();
+    // Pontos melhores por cima, para o mapa não ficar dominado pelos inviáveis
+    data.sort((a, b) => a.score - b.score);
+    let inv = 0;
+    data.forEach(s => {
+      if (s.inviavel) inv++;
+      const corPont = scoreColor(s.score);
+      const cor = modo === 'fator' ? COR_FATOR[s.limitante] : corPont;
+      const vazio = s.inviavel && modo !== 'fator';
+      L.circleMarker([s.lat, s.lon], {
+        radius: 4.5, weight: s.inviavel ? 1.5 : .8,
+        color: s.inviavel ? '#ef4444' : '#0a0f0a', dashArray: s.inviavel ? '2' : null,
+        fillColor: vazio ? '#0a0f0a' : cor, fillOpacity: vazio ? .6 : .9,
+      }).bindTooltip(`${s.nome}/${s.uf} · ${fmtBR(s.score, 1)} pts`, { direction: 'top', offset: [0, -4] })
+        .bindPopup(`
+        <div style="font-weight:700;color:#fff">${s.nome} (${s.codigo}) · ${s.uf}</div>
+        <div style="margin:4px 0 6px">${MONTHS_FULL[month]}: <b style="color:${corPont}">${fmtBR(s.score, 1)} pontos</b>
+          ${s.inviavel ? '<br><span style="color:#fca5a5">⚠ inviável: variável fora do limite absoluto</span>' : ''}</div>
+        ${barraPopup('🌡', 'Temperatura', s.temp, '°C', s.s_temp)}
+        ${barraPopup('🌧', 'Chuva', s.precip, 'mm', s.s_precip)}
+        ${barraPopup('💧', 'Umidade', s.umidade, '%', s.s_umid)}
+        <div style="color:#9ca3af;margin-top:4px">${s.n_anos} ano(s) de dados neste mês</div>
+        <button onclick="analyzeFromMap('${s.codigo}','${s.uf}','${crop}',${month})"
+          style="margin-top:6px;padding:4px 10px;border-radius:6px;background:#15803d;color:#fff;border:none;cursor:pointer">
+          Analisar esta estação →</button>`, { minWidth: 280 })
+       .addTo(_mapLayer);
+      L.marker([s.lat, s.lon], {
+        interactive: false, keyboard: false,
+        icon: L.divIcon({ className: '', html: `<div class="st-label">${nomeCidade(s.nome)}</div>`, iconSize: [0, 0] }),
+      }).addTo(_labelLayer);
+    });
+    info.textContent = `${data.length} estações com dado local · ${inv} inviáveis · aproxime o zoom para ver os nomes`;
+    atualizarRotulos();
+    mapLegend(modo, data);
+  } catch (e) {
+    info.textContent = 'Erro ao carregar o mapa.';
+  }
+}
+
+function analyzeFromMap(code, uf, crop, month) {
+  document.getElementById('sel-uf').value = uf;
+  filterStations();
+  document.getElementById('sel-station').value = code;
+  selectCrop(crop);
+  for (let m = 1; m <= 12; m++) document.getElementById(`m${m}`).checked = (m === month);
+  _map.closePopup();
+  analyze();
+}
+
+// ── Explicar a nota ───────────────────────────────────────────────────────────
+function trapSVG(titulo, unidade, x, lim, s) {
+  const [a, b, c, d] = lim;
+  const lo = Math.min(a - (b - a) * 0.7, x), hi = Math.max(d + (d - c) * 0.7, x);
+  const W = 300, H = 130, pl = 10, pr = 10, pt = 16, pb = 34;
+  const X = v => pl + (v - lo) / (hi - lo) * (W - pl - pr);
+  const Y = v => pt + (1 - v) * (H - pt - pb);
+  const zona = (x1, x2, cor) => `<rect x="${X(x1)}" y="${pt}" width="${X(x2) - X(x1)}" height="${H - pt - pb}" fill="${cor}"/>`;
+  const tick = (v, l) => `<line x1="${X(v)}" y1="${Y(0)}" x2="${X(v)}" y2="${Y(0) + 4}" stroke="#6b7280"/>
+    <text x="${X(v)}" y="${Y(0) + 15}" fill="#9ca3af" font-size="9" text-anchor="middle">${l}=${v}</text>`;
+  const cor = s === 0 ? '#ef4444' : s === 1 ? '#22c55e' : '#eab308';
+  return `
+    <div class="glass-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;font-size:.75rem;margin-bottom:4px">
+        <b style="color:#86efac">${titulo}</b>
+        <span style="color:#e7f5e9">x = ${fmtBR(x, 1)} ${unidade} → <b style="color:${cor}">s = ${fmtBR(s, 3)}</b></span>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%">
+        ${zona(lo, a, 'rgba(239,68,68,.15)')}${zona(a, b, 'rgba(234,179,8,.15)')}
+        ${zona(b, c, 'rgba(34,197,94,.18)')}${zona(c, d, 'rgba(234,179,8,.15)')}${zona(d, hi, 'rgba(239,68,68,.15)')}
+        <polyline points="${X(lo)},${Y(0)} ${X(a)},${Y(0)} ${X(b)},${Y(1)} ${X(c)},${Y(1)} ${X(d)},${Y(0)} ${X(hi)},${Y(0)}"
+          fill="none" stroke="#e7f5e9" stroke-width="2"/>
+        <line x1="${X(x)}" y1="${Y(0)}" x2="${X(x)}" y2="${Y(s)}" stroke="${cor}" stroke-dasharray="3"/>
+        <line x1="${pl}" y1="${Y(s)}" x2="${X(x)}" y2="${Y(s)}" stroke="${cor}" stroke-dasharray="3"/>
+        <circle cx="${X(x)}" cy="${Y(s)}" r="4.5" fill="${cor}" stroke="#fff" stroke-width="1"/>
+        ${tick(a, 'a')}${tick(b, 'b')}${tick(c, 'c')}${tick(d, 'd')}
+        <text x="${pl}" y="${Y(1) - 4}" fill="#6b7280" font-size="8">s = 1</text>
+      </svg>
+    </div>`;
+}
+
+function openExplain(month) {
+  const r = _lastResult;
+  const m = r && r.months.find(x => x.month === month);
+  if (!m || m.score === null) return;
+  const crop = allCrops.find(c => c.key === r.crop);
+  const d = m.details;
+  const fav = crop.meses_favoraveis.includes(month);
+  document.getElementById('exp-title').textContent = `${m.month_name} · ${r.crop_name} · ${r.station_name}/${r.uf}`;
+  document.getElementById('exp-sub').textContent =
+    `${fmtBR(m.score, 1)} pontos · ${d.n_anos} ano(s) de dados` +
+    (m.fonte.tipo === 'vizinha' ? ` · dados da estação vizinha ${m.fonte.nome} (${m.fonte.distancia_km} km)` : '');
+
+  const linha = (etapa, conta, res, destaque) => `
+    <tr style="border-bottom:1px solid rgba(255,255,255,.06)${destaque ? ';font-weight:700;color:#fff' : ''}">
+      <td style="padding:6px 8px">${etapa}</td>
+      <td style="padding:6px 8px;font-family:'JetBrains Mono',monospace;font-size:.72rem">${conta}</td>
+      <td style="padding:6px 8px;text-align:right">${res}</td></tr>`;
+
+  document.getElementById('exp-body').innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:20px">
+      ${trapSVG('Temperatura', '°C', m.temp_media, crop.temp, d.s_temp)}
+      ${trapSVG('Precipitação', 'mm', m.precip_total, crop.precip, d.s_precip)}
+      ${trapSVG('Umidade', '%', m.umidade_media, crop.umidade, d.s_umid)}
+    </div>
+    <p style="font-size:.75rem;color:#9ca3af;margin-bottom:12px">
+      Cada nota <i>s</i> vai de 0 (fora dos limites absolutos <i>a</i> e <i>d</i>) a 1 (faixa ótima entre <i>b</i> e <i>c</i>).
+      Faixas vermelhas: crítica; amarelas: atenção; verde: ótima.</p>
+    <table style="width:100%;font-size:.8rem;color:rgba(231,245,233,.8);border-collapse:collapse">
+      ${linha('1. Base ponderada', `0,35×${fmtBR(d.s_temp, 3)} + 0,40×${fmtBR(d.s_precip, 3)} + 0,25×${fmtBR(d.s_umid, 3)}`, fmtBR(d.base, 3))}
+      ${linha('2. Bônus de mês favorável', fav ? `${m.month_name} é favorável à cultura` : `${m.month_name} não é mês favorável`, fmtBR(d.bonus, 1))}
+      ${linha('3. Penalidade da chuva (P<sub>p</sub>)', `1 − 0,3 × ${fmtBR(d.precip_std, 1)} / (${fmtBR(m.precip_total, 1)} + 1)`, fmtBR(d.pen_precip, 3))}
+      ${linha('4. Penalidade da temperatura (P<sub>t</sub>)', `1 − 0,2 × ${fmtBR(d.temp_std, 2)} / 5`, fmtBR(d.pen_temp, 3))}
+      ${linha('5. Pontuação S', `100 × ${fmtBR(d.base, 3)} × ${fmtBR(d.bonus, 1)} × ${fmtBR(d.pen_precip, 3)} × ${fmtBR(d.pen_temp, 3)}`, fmtBR(m.score, 1), true)}
+    </table>
+    ${d.veto ? `<div style="margin-top:14px;padding:10px 12px;border-radius:10px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-size:.8rem">
+      ⚠ Mês inviável: pelo menos uma variável está fora dos limites absolutos da cultura (nota 0).
+      A soma ponderada ainda dá ${fmtBR(m.score, 1)} pontos, mas o mês não entra nos melhores meses.</div>` : ''}
+    ${d.n_anos <= 2 ? `<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:rgba(234,179,8,.1);border:1px solid rgba(234,179,8,.3);color:#fde047;font-size:.8rem">
+      ⚠ Indicador baseado em apenas ${d.n_anos} ano(s): a média pode não representar o clima típico do mês.</div>` : ''}`;
+  document.getElementById('exp-overlay').classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeExplain() {
+  document.getElementById('exp-overlay').classList.add('hidden');
+  document.body.style.overflow = '';
+}
+
+// ── Transparência dos dados ───────────────────────────────────────────────────
+function renderDataCard(r) {
+  const todos = [2005, 2007, 2008, 2009, 2013, 2020, 2021, 2022, 2023, 2024, 2025, 2026];
+  const usados = new Set(r.anos_usados);
+  const chips = todos.map(a => `<span style="display:inline-block;padding:3px 9px;margin:2px;border-radius:6px;font-size:.72rem;
+      ${usados.has(a) ? 'background:rgba(34,197,94,.18);color:#86efac;border:1px solid rgba(34,197,94,.35)'
+                      : 'background:rgba(255,255,255,.03);color:#4b5563;border:1px solid rgba(255,255,255,.08);text-decoration:line-through'}">${a}</span>`).join('');
+  const sel = new Set(r.months.map(m => m.month));
+  const meses = Array.from({ length: 12 }, (_, i) => i + 1).map(m => {
+    const n = r.n_anos_por_mes[m] || 0;
+    const cor = n === 0 ? '#4b5563' : n <= 2 ? '#facc15' : n <= 5 ? '#a3e635' : '#22c55e';
+    return `<div style="text-align:center;padding:6px 2px;border-radius:8px;${sel.has(m) ? 'outline:1px solid rgba(255,255,255,.35);' : ''}background:rgba(255,255,255,.03)">
+      <div style="font-size:.65rem;color:#9ca3af">${MONTHS[m]}</div>
+      <div style="font-size:1rem;font-weight:800;color:${cor}">${n || '—'}</div></div>`;
+  }).join('');
+  const poucos = r.months.filter(m => m.details && m.details.n_anos <= 2).map(m => m.month_name);
+  document.getElementById('data-card').innerHTML = `
+    <h3 class="font-bold text-white mb-1">Dados usados nesta estação</h3>
+    <p class="text-xs text-green-200/50 mb-4">Anos com ao menos um mês completo (critério de 80% das horas) e número de anos por mês do ano.
+      As médias usam poucos anos, abaixo dos 30 de uma normal climatológica.</p>
+    <div class="mb-4">${chips}</div>
+    <div style="display:grid;grid-template-columns:repeat(12,1fr);gap:4px">${meses}</div>
+    <p class="text-xs mt-3" style="color:#9ca3af">Número de anos por mês: <span style="color:#facc15">1–2 (frágil)</span> ·
+      <span style="color:#a3e635">3–5</span> · <span style="color:#22c55e">6 ou mais</span>. Meses selecionados com contorno.</p>
+    ${poucos.length ? `<p class="text-xs mt-2" style="color:#fde047">⚠ ${poucos.join(', ')}: indicador com 2 anos ou menos.</p>` : ''}`;
 }
 
 function renderResult(r) {
@@ -1571,6 +1733,7 @@ function renderResult(r) {
   // Month cards
   const mgrid = document.getElementById('months-grid');
   mgrid.innerHTML = '';
+  const cropAtual = allCrops.find(c => c.key === r.crop);
   r.months.forEach(m => {
     if (m.score === null) {
       mgrid.innerHTML += `
@@ -1586,7 +1749,7 @@ function renderResult(r) {
     const veto = m.status === 'inviavel'
       ? `<div class="text-red-300 font-semibold mt-1">⚠ Inviável: variável fora do limite absoluto</div>` : '';
     mgrid.innerHTML += `
-      <div class="month-card ${m.status}">
+      <div class="month-card clicavel ${m.status}" onclick="openExplain(${m.month})" title="Ver o cálculo">
         <div class="flex justify-between items-start mb-2">
           <span class="text-white font-bold text-sm">${m.month_name}</span>
           <span class="text-xs font-bold" style="color:${scoreColor(m.score)}">${fmtBR(m.score, 1)} pts</span>
@@ -1594,10 +1757,9 @@ function renderResult(r) {
         <div class="w-full bg-white/10 rounded-full h-1.5 mb-3">
           <div class="h-1.5 rounded-full" style="width:${bar}%;background:${scoreColor(m.score)};transition:width .8s ease"></div>
         </div>
-        <div class="space-y-1 text-xs text-green-200/70">
-          <div>🌡 ${fmtBR(m.temp_media, 1)} °C</div>
-          <div>🌧 ${fmtBR(m.precip_total, 0)} mm</div>
-          <div>💧 ${fmtBR(m.umidade_media, 0)}%</div>
+        <div class="space-y-1">${fatorBars(m)}</div>
+        ${chipLimitante(limitanteMes(m, cropAtual))}
+        <div class="space-y-1 text-xs text-green-200/70 mt-2">
           <div class="text-green-200/40">${m.details.n_anos} ano(s) de dados</div>
           ${fonte}${veto}
         </div>
@@ -1650,6 +1812,8 @@ function renderResult(r) {
 
   // Análise detalhada
   renderDetailedAnalysis(r);
+  renderDataCard(r);
+  renderResumo(r);
 }
 
 function renderDetailedAnalysis(r) {
@@ -1825,9 +1989,6 @@ function renderScoreChart(labels, data, color) {
 
 function resetAnalysis() {
   document.getElementById('resultado').classList.add('hidden');
-  document.getElementById('log-section').classList.add('hidden');
-  document.getElementById('log-body').classList.remove('open');
-  document.getElementById('log-toggle-icon').textContent = '[expandir]';
   document.getElementById('analise').scrollIntoView({ behavior: 'smooth' });
 }
 
@@ -1836,7 +1997,8 @@ async function fetchJSON(url, opts = {}) {
   const res = await fetch(url, opts);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || `HTTP ${res.status}`);
+    const det = Array.isArray(body.detail) ? body.detail.map(d => d.msg).join('; ') : body.detail;
+    throw new Error(det || `HTTP ${res.status}`);
   }
   return res.json();
 }
