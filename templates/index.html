@@ -78,6 +78,8 @@
     .month-card.moderado  { background: rgba(234,179,8,.10);  border-color: rgba(234,179,8,.35); }
     .month-card.ruim      { background: rgba(249,115,22,.10); border-color: rgba(249,115,22,.3); }
     .month-card.critico   { background: rgba(239,68,68,.08);  border-color: rgba(239,68,68,.25); }
+    .month-card.inviavel  { background: rgba(239,68,68,.14);  border-color: rgba(239,68,68,.55); border-style: dashed; }
+    .month-card.sem_dados { background: rgba(255,255,255,.03); border-color: rgba(255,255,255,.12); border-style: dashed; }
 
     /* ── Select/Input ── */
     .inp {
@@ -426,19 +428,20 @@
       </div>
       <div class="glass-card p-6">
         <div class="w-12 h-12 rounded-xl bg-green-900/60 flex items-center justify-center text-2xl mb-4">🤖</div>
-        <h3 class="font-bold text-white mb-2">Machine Learning</h3>
+        <h3 class="font-bold text-white mb-2">Regra explícita</h3>
         <p class="text-sm text-green-200/65 leading-relaxed">
-          Random Forest treinado em normais climáticas para estimar a viabilidade de plantio,
-          cruzando variáveis como temperatura média, pluviosidade e umidade com os
-          requisitos agronômicos de cada cultura.
+          Cada variável recebe uma nota de 0 a 1 por uma função trapezoidal (faixa ótima e
+          limites absolutos da cultura). A pontuação mostrada é a própria regra, com o cálculo
+          visível. Um Random Forest foi avaliado como modelo substituto, mas não é usado na consulta.
         </p>
       </div>
       <div class="glass-card p-6">
         <div class="w-12 h-12 rounded-xl bg-green-900/60 flex items-center justify-center text-2xl mb-4">📊</div>
         <h3 class="font-bold text-white mb-2">Recomendação</h3>
         <p class="text-sm text-green-200/65 leading-relaxed">
-          O sistema gera um score de viabilidade (0–100%) com base em padrões históricos,
-          destaca os melhores meses do ano e emite alertas sobre riscos climáticos específicos.
+          O sistema gera uma pontuação de adequação climática histórica (0 a 100 pontos, não é
+          probabilidade), destaca os melhores meses do ano e emite alertas quando alguma variável
+          sai dos limites absolutos da cultura.
         </p>
       </div>
     </div>
@@ -543,8 +546,8 @@
               stroke-dasharray="351.86" stroke-dashoffset="351.86"
               class="gauge-ring" style="transition: stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1), stroke .5s"/>
             <text x="70" y="65" text-anchor="middle" font-size="28" font-weight="900" fill="white" id="gauge-num">0</text>
-            <text x="70" y="82" text-anchor="middle" font-size="11" fill="#86efac">viabilidade</text>
-            <text x="70" y="97" text-anchor="middle" font-size="9" fill="#4ade80">%</text>
+            <text x="70" y="82" text-anchor="middle" font-size="11" fill="#86efac">pontos</text>
+            <text x="70" y="97" text-anchor="middle" font-size="9" fill="#4ade80">de 0 a 100</text>
           </svg>
           <div id="res-verdict" class="text-sm font-bold text-green-400 mt-1 text-center">—</div>
         </div>
@@ -553,7 +556,7 @@
       <!-- Alert -->
       <div id="res-alert" class="hidden mt-4 bg-amber-900/30 border border-amber-600/40 rounded-xl p-4 text-sm text-amber-300 flex gap-3">
         <span class="text-lg">⚠️</span>
-        <span id="res-alert-text"></span>
+        <ul id="res-alert-text" class="space-y-1 list-none"></ul>
       </div>
 
       <!-- Best months -->
@@ -592,8 +595,8 @@
         <canvas id="chart-umidade" height="200"></canvas>
       </div>
       <div class="glass-card p-6">
-        <h3 class="font-bold text-white mb-1 text-sm">Score de Viabilidade por Mês</h3>
-        <p class="text-xs text-green-200/50 mb-4">Score ML para os meses selecionados</p>
+        <h3 class="font-bold text-white mb-1 text-sm">Pontuação por Mês (0–100)</h3>
+        <p class="text-xs text-green-200/50 mb-4">Regra trapezoidal aplicada aos meses selecionados</p>
         <canvas id="chart-score" height="200"></canvas>
       </div>
     </div>
@@ -611,12 +614,19 @@
               <th class="pb-3 text-center">Temp Mín</th>
               <th class="pb-3 text-center">Precip.</th>
               <th class="pb-3 text-center">Umidade</th>
-              <th class="pb-3 text-center">Viabilidade</th>
+              <th class="pb-3 text-center">Pontuação</th>
+              <th class="pb-3 text-left pl-4">Cálculo da regra</th>
             </tr>
           </thead>
           <tbody id="detail-table"></tbody>
         </table>
       </div>
+      <p class="text-xs text-green-200/50 mt-4 leading-relaxed">
+        S = 100 × (0,35·s<sub>temp</sub> + 0,40·s<sub>precip</sub> + 0,25·s<sub>umid</sub>) × B × P<sub>p</sub> × P<sub>t</sub>.
+        Cada nota s vai de 0 (fora dos limites absolutos) a 1 (faixa ótima); B = 1,1 em mês favorável;
+        P<sub>p</sub> e P<sub>t</sub> descontam a variabilidade entre anos. Temp Máx/Mín são médias dos extremos absolutos de cada mês.
+        Mês com alguma nota 0 é marcado como inviável.
+      </p>
     </div>
 
     <!-- Análise Detalhada -->
@@ -854,9 +864,9 @@ const LITERATURA = {
       {
         autor: 'EMBRAPA SOJA',
         titulo: 'Tecnologias de Produção de Soja — Região Central do Brasil 2012 e 2013',
-        local: 'Londrina: Embrapa Soja (Sistema de Produção, 15)', ano: '2011',
-        url: 'https://ainfo.cnptia.embrapa.br/digital/bitstream/item/23225/1/Sistema-Producao14-VE.pdf',
-        label: 'PDF — ainfo.cnptia.embrapa.br',
+        local: 'Londrina: Embrapa Soja (Sistemas de Produção, 15)', ano: '2011',
+        url: 'https://www.infoteca.cnptia.embrapa.br/infoteca/bitstream/doc/904487/4/SP15VE2011.pdf',
+        label: 'PDF — infoteca.cnptia.embrapa.br',
       },
       {
         autor: 'FARIAS, J. R. B.; NEPOMUCENO, A. L.; NEUMAIER, N.',
@@ -1042,10 +1052,10 @@ const LITERATURA = {
       },
       {
         autor: 'DOORENBOS, J.; KASSAM, A. H.',
-        titulo: 'Efeito da Água no Rendimento das Culturas — FAO Irrigation and Drainage Paper 33',
-        local: 'Roma: FAO / Campina Grande: UFPB', ano: '1994',
-        url: 'https://www.fao.org/3/x0490e/x0490e00.htm',
-        label: 'FAO — Documento oficial completo',
+        titulo: 'Yield response to water — FAO Irrigation and Drainage Paper 33 (trad. bras.: Efeito da água no rendimento das culturas, UFPB, 1994)',
+        local: 'Roma: FAO', ano: '1979',
+        url: 'https://agris.fao.org/search/en/records/64724f9353aa8c896305d1b7',
+        label: 'AGRIS/FAO — Registro da obra',
       },
       {
         autor: 'BARBOSA, M. H. P. et al.',
@@ -1254,10 +1264,8 @@ function renderLitCrop(key) {
 
 // ── Terminal ──────────────────────────────────────────────────────────────────
 const STEP_PCT = {
-  init:12, station:20, loading:27, records:35,
-  normals_calc:42, normals_done:50, crop:57, crop_req:63,
-  ml_init:68, ml_features:73,
-  scoring:92, complete:97, result:100, error:100,
+  init:15, station:30, records:45, crop:60,
+  complete:97, result:100, error:100,
 };
 
 let _termTimer   = null;
@@ -1382,7 +1390,7 @@ function termPrint(step, msg, detail) {
       if (detail) termRaw('tl-sub', `       [ ${detail} ]`);
       break;
 
-    case 'ml_month':
+    case 'rule_month':
       termRaw('tl-ml',  `${ts}  ›  ${msg}`);
       if (detail) termRaw('tl-sub', `       ${detail}`);
       break;
@@ -1468,19 +1476,15 @@ function analyze() {
     const { step, msg, detail, data, result } = d;
 
     // ── progresso na statusbar ──────────────────────────────────
-    if (step === 'ml_month') {
+    if (step === 'rule_month') {
       monthCount++;
-      const pct = Math.round(73 + (monthCount / _termMonths) * 18);
-      termProg(pct, `Calculando ${MONTHS_FULL[data?.month] || ''}...`);
+      const pct = Math.round(60 + (monthCount / _termMonths) * 35);
+      termProg(pct, `Pontuando ${MONTHS_FULL[data?.month] || ''}...`);
     } else if (STEP_PCT[step] !== undefined) {
       const labels = {
         init:'Motor iniciando...', station:'Estação localizada',
-        loading:'Carregando dados INMET...', records:'Séries históricas prontas',
-        normals_calc:'Calculando normais...', normals_done:'Normais prontas',
-        crop:'Cultura carregada', crop_req:'Requisitos definidos',
-        ml_init:'Random Forest carregado', ml_features:'Features extraídas',
-        scoring:'Calculando score geral...', complete:'Análise concluída',
-        result:'Enviando resultado...', error:'Erro',
+        records:'Indicadores carregados', crop:'Requisitos da cultura',
+        complete:'Análise concluída', result:'Enviando resultado...', error:'Erro',
       };
       termProg(STEP_PCT[step], labels[step] || msg.slice(0,40));
     }
@@ -1524,7 +1528,7 @@ function renderResult(r) {
   document.getElementById('res-title').textContent =
     `${r.crop_name} · ${r.station_name} / ${r.uf}`;
   document.getElementById('res-subtitle').textContent =
-    `Análise climática baseada em dados históricos do INMET`;
+    `Dados históricos do INMET (${r.periodo_dados}) · ${r.metodo}`;
 
   // Gauge
   const pct = r.overall_score / 100;
@@ -1533,14 +1537,20 @@ function renderResult(r) {
   const arc = document.getElementById('gauge-arc');
   arc.style.strokeDashoffset = offset;
   arc.style.stroke = r.verdict_color;
-  document.getElementById('gauge-num').textContent = r.overall_score.toFixed(0);
+  document.getElementById('gauge-num').textContent = fmtBR(r.overall_score, 1);
   document.getElementById('res-verdict').textContent = r.verdict;
   document.getElementById('res-verdict').style.color = r.verdict_color;
 
   // Alert
   const alertEl = document.getElementById('res-alert');
-  if (r.alert) {
-    document.getElementById('res-alert-text').textContent = r.alert;
+  const alertList = document.getElementById('res-alert-text');
+  alertList.innerHTML = '';
+  if (r.alerts && r.alerts.length > 0) {
+    r.alerts.forEach(a => {
+      const li = document.createElement('li');
+      li.textContent = a;
+      alertList.appendChild(li);
+    });
     alertEl.classList.remove('hidden');
   } else {
     alertEl.classList.add('hidden');
@@ -1562,20 +1572,34 @@ function renderResult(r) {
   const mgrid = document.getElementById('months-grid');
   mgrid.innerHTML = '';
   r.months.forEach(m => {
+    if (m.score === null) {
+      mgrid.innerHTML += `
+        <div class="month-card sem_dados">
+          <div class="text-white font-bold text-sm mb-2">${m.month_name}</div>
+          <div class="text-xs text-green-200/50">Sem dados da estação nem de vizinha próxima. Mês não pontuado.</div>
+        </div>`;
+      return;
+    }
     const bar = Math.round(m.score);
+    const fonte = m.fonte.tipo === 'vizinha'
+      ? `<div class="text-amber-300/80 mt-1">↪ dados de ${m.fonte.nome} (${m.fonte.distancia_km} km)</div>` : '';
+    const veto = m.status === 'inviavel'
+      ? `<div class="text-red-300 font-semibold mt-1">⚠ Inviável: variável fora do limite absoluto</div>` : '';
     mgrid.innerHTML += `
       <div class="month-card ${m.status}">
         <div class="flex justify-between items-start mb-2">
           <span class="text-white font-bold text-sm">${m.month_name}</span>
-          <span class="text-xs font-bold" style="color:${scoreColor(m.score)}">${m.score.toFixed(0)}%</span>
+          <span class="text-xs font-bold" style="color:${scoreColor(m.score)}">${fmtBR(m.score, 1)} pts</span>
         </div>
         <div class="w-full bg-white/10 rounded-full h-1.5 mb-3">
           <div class="h-1.5 rounded-full" style="width:${bar}%;background:${scoreColor(m.score)};transition:width .8s ease"></div>
         </div>
         <div class="space-y-1 text-xs text-green-200/70">
-          <div>🌡 ${m.temp_media.toFixed(1)}°C</div>
-          <div>🌧 ${m.precip_total.toFixed(0)} mm</div>
-          <div>💧 ${m.umidade_media.toFixed(0)}%</div>
+          <div>🌡 ${fmtBR(m.temp_media, 1)} °C</div>
+          <div>🌧 ${fmtBR(m.precip_total, 0)} mm</div>
+          <div>💧 ${fmtBR(m.umidade_media, 0)}%</div>
+          <div class="text-green-200/40">${m.details.n_anos} ano(s) de dados</div>
+          ${fonte}${veto}
         </div>
       </div>`;
   });
@@ -1584,19 +1608,28 @@ function renderResult(r) {
   const tbody = document.getElementById('detail-table');
   tbody.innerHTML = '';
   r.months.forEach(m => {
+    if (m.score === null) {
+      tbody.innerHTML += `
+        <tr class="border-b border-white/5">
+          <td class="py-3 text-white font-medium">${m.month_name}</td>
+          <td colspan="7" class="py-3 text-center text-green-200/40">sem dados</td>
+        </tr>`;
+      return;
+    }
     tbody.innerHTML += `
       <tr class="border-b border-white/5 hover:bg-white/3 transition-colors">
         <td class="py-3 text-white font-medium">${m.month_name}</td>
-        <td class="py-3 text-center text-green-200/80">${m.temp_media.toFixed(1)}°C</td>
-        <td class="py-3 text-center text-orange-300/80">${m.details.temp_max?.toFixed(1) ?? '—'}°C</td>
-        <td class="py-3 text-center text-sky-300/80">${m.details.temp_min?.toFixed(1) ?? '—'}°C</td>
-        <td class="py-3 text-center text-blue-300/80">${m.precip_total.toFixed(0)} mm</td>
-        <td class="py-3 text-center text-teal-300/80">${m.umidade_media.toFixed(0)}%</td>
+        <td class="py-3 text-center text-green-200/80">${fmtBR(m.temp_media, 1)} °C</td>
+        <td class="py-3 text-center text-orange-300/80">${fmtBR(m.details.temp_max, 1)} °C</td>
+        <td class="py-3 text-center text-sky-300/80">${fmtBR(m.details.temp_min, 1)} °C</td>
+        <td class="py-3 text-center text-blue-300/80">${fmtBR(m.precip_total, 0)} mm</td>
+        <td class="py-3 text-center text-teal-300/80">${fmtBR(m.umidade_media, 0)}%</td>
         <td class="py-3 text-center">
           <span class="score-pill" style="background:${scoreColor(m.score)}22;color:${scoreColor(m.score)};border:1px solid ${scoreColor(m.score)}55">
-            ${m.score.toFixed(1)}%
+            ${fmtBR(m.score, 1)}
           </span>
         </td>
+        <td class="py-3 pl-4 text-left text-green-200/60" style="font-family:'JetBrains Mono',monospace;font-size:.68rem">${m.details.formula}</td>
       </tr>`;
   });
 
@@ -1610,8 +1643,9 @@ function renderResult(r) {
   }
 
   // Score chart
-  const scoreLabels = r.months.map(m => MONTHS_FULL[m.month]);
-  const scoreData = r.months.map(m => m.score);
+  const pontuados = r.months.filter(m => m.score !== null);
+  const scoreLabels = pontuados.map(m => MONTHS_FULL[m.month]);
+  const scoreData = pontuados.map(m => m.score);
   renderScoreChart(scoreLabels, scoreData, r.verdict_color);
 
   // Análise detalhada
@@ -1656,7 +1690,7 @@ function renderDetailedAnalysis(r) {
     atencao: { bg:'rgba(234,179,8,.08)', border:'rgba(234,179,8,.35)',  val:'#facc15', badge:'rgba(234,179,8,.18)',  badgeTxt:'#fde047',  label:'Atenção' },
     critico: { bg:'rgba(239,68,68,.08)', border:'rgba(239,68,68,.28)',  val:'#f87171', badge:'rgba(239,68,68,.18)',  badgeTxt:'#fca5a5',  label:'Crítico' },
   };
-  (r.var_analyses || []).forEach(va => {
+  (r.var_analyses || []).filter(Boolean).forEach(va => {
     const c = SC[va.status] || SC.atencao;
     varEl.innerHTML += `
       <div style="background:${c.bg};border:1px solid ${c.border};border-radius:16px;padding:22px;display:flex;flex-direction:column;gap:10px">
@@ -1670,7 +1704,8 @@ function renderDetailedAnalysis(r) {
         </div>
         <div style="font-size:.72rem;color:rgba(231,245,233,.5);line-height:1.5">
           <span style="color:#4ade80">Ótimo:</span> ${va.faixa_otima}<br>
-          <span style="color:rgba(74,222,128,.5)">Tolerado:</span> ${va.faixa_tolerada}
+          <span style="color:rgba(74,222,128,.5)">Tolerado:</span> ${va.faixa_tolerada}<br>
+          <span style="color:rgba(231,245,233,.7)">Observado:</span> ${va.faixa_observada} · pior mês: ${va.mes_referencia}
         </div>
         <div style="font-weight:700;font-size:.85rem;color:#fff">${va.titulo}</div>
         <p style="font-size:.78rem;color:rgba(231,245,233,.7);line-height:1.6;margin:0">${va.explicacao}</p>
@@ -1754,7 +1789,7 @@ function renderScoreChart(labels, data, color) {
     data: {
       labels,
       datasets: [{
-        label: 'Viabilidade (%)',
+        label: 'Pontuação (0-100)',
         data,
         backgroundColor: data.map(v => scoreColor(v) + 'AA'),
         borderColor: data.map(v => scoreColor(v)),
@@ -1773,14 +1808,14 @@ function renderScoreChart(labels, data, color) {
           borderWidth: 1,
           titleColor: '#86efac',
           bodyColor: '#d1fae5',
-          callbacks: { label: ctx => ` ${ctx.parsed.y?.toFixed(1)}%` },
+          callbacks: { label: ctx => ` ${fmtBR(ctx.parsed.y, 1)} pontos` },
         },
       },
       scales: {
         x: { ticks: { color: '#9ca3af', font: { size: 10 } }, grid: { display: false } },
         y: {
           min: 0, max: 100,
-          ticks: { color: '#9ca3af', font: { size: 10 }, callback: v => v + '%' },
+          ticks: { color: '#9ca3af', font: { size: 10 }, callback: v => v + ' pts' },
           grid: { color: 'rgba(255,255,255,.05)' },
         },
       },
@@ -1806,7 +1841,9 @@ async function fetchJSON(url, opts = {}) {
   return res.json();
 }
 
-function showLoading(_on) { /* substituído pelo terminal SSE */ }
+function fmtBR(v, nd) {
+  return (v === null || v === undefined) ? '—' : Number(v).toFixed(nd).replace('.', ',');
+}
 
 function showToast(msg) {
   document.getElementById('toast-msg').textContent = msg;

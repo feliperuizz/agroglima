@@ -5,17 +5,22 @@ Estratégia:
 - Para cada estação + mês + cultura: calcula um "score de aptidão"
   baseado em quão bem as condições históricas atendem os requisitos da cultura
 - Treina um Random Forest Regressor para aprender esses padrões
-- Salva o modelo e os encoders
+- Avalia com GroupKFold por estação contra uma linha de base (média por cultura e mês)
+- Salva o modelo, os encoders e as métricas (api/models/metrics.json)
+
+Desde a versão 1.1 a API serve a regra diretamente (exata e explicável);
+o modelo é mantido como objeto de avaliação do trabalho.
 """
 
+import json
 import numpy as np
 import pandas as pd
 import joblib
+import sklearn
 from pathlib import Path
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import cross_val_score
-from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import GroupKFold
 from sklearn.metrics import mean_absolute_error, r2_score
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -152,13 +157,20 @@ def aptidao_score(val, t_min, t_ot_min, t_ot_max, t_max):
     return (t_max - val) / (t_max - t_ot_max) if t_max != t_ot_max else 1.0
 
 
-def compute_crop_score(row, crop_key):
-    """Calcula score total (0-100) de aptidão climática de um mês para uma cultura."""
+PESOS = {"temp": 0.35, "precip": 0.40, "umid": 0.25}
+
+
+def score_breakdown(row, crop_key) -> dict:
+    """
+    Decompõe a pontuação de um mês: notas parciais, base ponderada, bônus,
+    penalidades e pontuação final. `veto` indica variável fora dos limites absolutos.
+    """
     req = CROP_REQUIREMENTS[crop_key]
 
     s_temp = aptidao_score(row["temp_norm"], *req["temp"])
     s_precip = aptidao_score(row["precip_norm"], *req["precip"])
     s_umid = aptidao_score(row["umidade_norm"], *req["umidade"])
+    base = s_temp * PESOS["temp"] + s_precip * PESOS["precip"] + s_umid * PESOS["umid"]
 
     # Bonus de mês favorável
     bonus = 1.1 if row["month"] in req["meses_favoraveis"] else 1.0
@@ -167,8 +179,19 @@ def compute_crop_score(row, crop_key):
     pen_precip = max(0.0, 1.0 - (row.get("precip_std", 0) / (row["precip_norm"] + 1)) * 0.3)
     pen_temp = max(0.0, 1.0 - (row.get("temp_std", 0) / 5.0) * 0.2)
 
-    score = (s_temp * 0.35 + s_precip * 0.40 + s_umid * 0.25) * bonus * pen_precip * pen_temp
-    return min(100.0, round(score * 100, 1))
+    score = min(100.0, round(base * bonus * pen_precip * pen_temp * 100, 1))
+    return {
+        "s_temp": float(s_temp), "s_precip": float(s_precip), "s_umid": float(s_umid),
+        "base": float(base), "bonus": bonus,
+        "pen_precip": float(pen_precip), "pen_temp": float(pen_temp),
+        "score": float(score),
+        "veto": bool(min(s_temp, s_precip, s_umid) == 0.0),
+    }
+
+
+def compute_crop_score(row, crop_key):
+    """Calcula score total (0-100) de aptidão climática de um mês para uma cultura."""
+    return score_breakdown(row, crop_key)["score"]
 
 
 def build_training_data(normals: pd.DataFrame) -> pd.DataFrame:
@@ -199,73 +222,151 @@ def build_training_data(normals: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def train():
-    normals_path = DATA_DIR / "climate_normals.pkl"
-    if not normals_path.exists():
+FEATURE_COLS = [
+    "lat", "lon", "month", "crop_enc", "uf_enc", "regiao_enc",
+    "temp_norm", "temp_std", "temp_max_norm", "temp_min_norm",
+    "precip_norm", "precip_std",
+    "umidade_norm", "umidade_std",
+    "n_anos",
+]
+
+# Hiperparâmetros do modelo; max_features=1.0 é o padrão do scikit-learn >= 1.1
+# (todas as variáveis avaliadas em cada divisão) e fica explícito para reprodução.
+RF_PARAMS = dict(
+    n_estimators=200,
+    max_depth=12,
+    min_samples_leaf=5,
+    max_features=1.0,
+    n_jobs=-1,
+    random_state=42,
+)
+
+STD_DEFAULTS = {"precip_std": 30, "temp_std": 2, "umidade_std": 8}
+
+
+def load_normals(path: Path = DATA_DIR / "climate_normals.pkl") -> pd.DataFrame:
+    """Carrega os indicadores e preenche desvios indefinidos (células de um único ano)."""
+    if not path.exists():
         raise FileNotFoundError(
-            f"Arquivo {normals_path} não encontrado. Execute preprocess.py primeiro."
+            f"Arquivo {path} não encontrado. Execute preprocess.py primeiro."
         )
+    normals = pd.read_pickle(path)
+    return normals.fillna(STD_DEFAULTS)
 
-    print("Carregando normais climáticas...")
-    normals = pd.read_pickle(normals_path)
-    normals.fillna({"precip_std": 30, "temp_std": 2, "umidade_std": 8}, inplace=True)
 
-    print(f"  {len(normals)} normais climáticas carregadas")
+def encode(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Aplica os LabelEncoders de UF, região, cultura e estação."""
+    encoders = {
+        "le_uf": LabelEncoder(), "le_regiao": LabelEncoder(),
+        "le_crop": LabelEncoder(), "le_codigo": LabelEncoder(),
+    }
+    df = df.copy()
+    df["uf_enc"] = encoders["le_uf"].fit_transform(df["uf"].fillna("XX"))
+    df["regiao_enc"] = encoders["le_regiao"].fit_transform(df["regiao"].fillna("XX"))
+    df["crop_enc"] = encoders["le_crop"].fit_transform(df["crop"])
+    df["codigo_enc"] = encoders["le_codigo"].fit_transform(df["codigo"].fillna("XX"))
+    return df, encoders
+
+
+def group_cv(df: pd.DataFrame, groups: pd.Series, n_splits: int = 5,
+             feature_cols: list[str] = FEATURE_COLS, splitter=None) -> dict:
+    """
+    Validação cruzada agrupada: um Random Forest novo é treinado em cada partição
+    de treino; a linha de base (média do alvo por cultura e mês) também é calculada
+    só com as partições de treino. Retorna métricas médias, por parte e por cultura.
+    """
+    X = df[feature_cols].fillna(0).values
+    y = df["score"].values
+    pred_rf = np.zeros(len(df))
+    pred_base = np.zeros(len(df))
+    folds = []
+
+    splitter = splitter or GroupKFold(n_splits=n_splits)
+    for k, (tr, te) in enumerate(splitter.split(X, y, groups)):
+        model = RandomForestRegressor(**RF_PARAMS).fit(X[tr], y[tr])
+        pred_rf[te] = model.predict(X[te])
+
+        base = df.iloc[tr].groupby(["crop", "month"])["score"].mean()
+        chave = pd.MultiIndex.from_frame(df.iloc[te][["crop", "month"]])
+        pred_base[te] = base.reindex(chave).fillna(df["score"].iloc[tr].mean()).values
+
+        folds.append({
+            "parte": k + 1,
+            "grupos_teste": int(pd.Series(groups).iloc[te].nunique()) if groups is not None else None,
+            "r2_rf": float(r2_score(y[te], pred_rf[te])),
+            "mae_rf": float(mean_absolute_error(y[te], pred_rf[te])),
+            "r2_base": float(r2_score(y[te], pred_base[te])),
+            "mae_base": float(mean_absolute_error(y[te], pred_base[te])),
+        })
+
+    por_cultura = {
+        crop: {
+            "mae_rf": float(mean_absolute_error(y[m], pred_rf[m])),
+            "mae_base": float(mean_absolute_error(y[m], pred_base[m])),
+        }
+        for crop in sorted(df["crop"].unique())
+        for m in [(df["crop"] == crop).values]
+    }
+
+    return {
+        "n_splits": n_splits,
+        "r2_rf": float(np.mean([f["r2_rf"] for f in folds])),
+        "mae_rf": float(np.mean([f["mae_rf"] for f in folds])),
+        "r2_base": float(np.mean([f["r2_base"] for f in folds])),
+        "mae_base": float(np.mean([f["mae_base"] for f in folds])),
+        "partes": folds,
+        "por_cultura": por_cultura,
+    }
+
+
+def train():
+    print("Carregando indicadores mensais...")
+    normals = load_normals()
+    print(f"  {len(normals)} indicadores estação-mês carregados")
 
     print("Construindo dataset de treino...")
     df = build_training_data(normals)
     print(f"  {len(df)} exemplos de treino gerados")
 
-    # Encoders
-    le_uf = LabelEncoder()
-    le_regiao = LabelEncoder()
-    le_crop = LabelEncoder()
-    le_codigo = LabelEncoder()
+    df, encoders = encode(df)
 
-    df["uf_enc"] = le_uf.fit_transform(df["uf"].fillna("XX"))
-    df["regiao_enc"] = le_regiao.fit_transform(df["regiao"].fillna("XX"))
-    df["crop_enc"] = le_crop.fit_transform(df["crop"])
-    df["codigo_enc"] = le_codigo.fit_transform(df["codigo"].fillna("XX"))
+    print("Validação cruzada agrupada por estação (GroupKFold, 5 partes)...")
+    cv = group_cv(df, df["codigo"])
+    print(f"  Random Forest:  R² {cv['r2_rf']:.3f} | MAE {cv['mae_rf']:.2f}")
+    print(f"  Linha de base:  R² {cv['r2_base']:.3f} | MAE {cv['mae_base']:.2f}")
 
-    feature_cols = [
-        "lat", "lon", "month", "crop_enc", "uf_enc", "regiao_enc",
-        "temp_norm", "temp_std", "temp_max_norm", "temp_min_norm",
-        "precip_norm", "precip_std",
-        "umidade_norm", "umidade_std",
-        "n_anos",
-    ]
-
-    X = df[feature_cols].fillna(0).values
+    print("Treinando Random Forest final (todas as estações)...")
+    X = df[FEATURE_COLS].fillna(0).values
     y = df["score"].values
-
-    print("Treinando Random Forest...")
-    model = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=12,
-        min_samples_leaf=5,
-        n_jobs=-1,
-        random_state=42,
-    )
-    model.fit(X, y)
-
-    scores_cv = cross_val_score(model, X, y, cv=5, scoring="r2", n_jobs=-1)
-    print(f"  R² cross-validation: {scores_cv.mean():.3f} ± {scores_cv.std():.3f}")
-
+    model = RandomForestRegressor(**RF_PARAMS).fit(X, y)
     pred_train = model.predict(X)
-    print(f"  MAE treino: {mean_absolute_error(y, pred_train):.2f}")
+    print(f"  Ajuste interno: R² {r2_score(y, pred_train):.3f} | MAE {mean_absolute_error(y, pred_train):.2f}")
 
     # Salva tudo
     artifacts = {
         "model": model,
-        "le_uf": le_uf,
-        "le_regiao": le_regiao,
-        "le_crop": le_crop,
-        "le_codigo": le_codigo,
-        "feature_cols": feature_cols,
+        **encoders,
+        "feature_cols": FEATURE_COLS,
         "crop_requirements": CROP_REQUIREMENTS,
     }
-    joblib.dump(artifacts, MODEL_DIR / "recommendation_model.joblib")
+    joblib.dump(artifacts, MODEL_DIR / "recommendation_model.joblib", compress=3)
+
+    metrics = {
+        "data": pd.Timestamp.now().isoformat(timespec="seconds"),
+        "sklearn": sklearn.__version__,
+        "rf_params": {k: v for k, v in RF_PARAMS.items() if k != "n_jobs"},
+        "n_exemplos": int(len(df)),
+        "ajuste_interno": {
+            "r2": float(r2_score(y, pred_train)),
+            "mae": float(mean_absolute_error(y, pred_train)),
+        },
+        "groupkfold_estacao": cv,
+    }
+    (MODEL_DIR / "metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(f"\nModelo salvo em {MODEL_DIR / 'recommendation_model.joblib'}")
+    print(f"Métricas salvas em {MODEL_DIR / 'metrics.json'}")
     print("Treinamento concluído!")
 
 

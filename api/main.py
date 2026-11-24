@@ -1,32 +1,71 @@
 """
 AgroClima - API de Recomendação de Plantio
-FastAPI backend com ML para auxílio a decisões agrícolas
+FastAPI backend para auxílio a decisões agrícolas
+
+Versão 1.1: a pontuação servida é a regra trapezoidal aplicada diretamente
+(exata e decomponível). O Random Forest de api/train_model.py é mantido apenas
+como objeto de avaliação (ver api/models/metrics.json e api/avaliacao.py).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import math
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 import numpy as np
 import pandas as pd
-import joblib
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
+
+from train_model import CROP_REQUIREMENTS, STD_DEFAULTS, score_breakdown
 
 BASE_ROOT = Path(__file__).parent.parent
 DATA_DIR = BASE_ROOT / "data"
-MODEL_DIR = Path(__file__).parent / "models"
 TEMPLATES_DIR = BASE_ROOT / "templates"
 STATIC_DIR = BASE_ROOT / "static"
 
-app = FastAPI(title="AgroClima API", version="1.0.0")
+# Estação vizinha quando falta o indicador local: até 150 km, com pelo menos 3 anos
+# naquele mês e até 500 m de diferença de altitude; as temperaturas da vizinha são
+# corrigidas pelo gradiente térmico vertical médio (6,5 °C por km).
+VIZINHA_MAX_KM = 150.0
+VIZINHA_MIN_ANOS = 3
+VIZINHA_MAX_DALT_M = 500.0
+GRADIENTE_TERMICO = 0.0065  # °C por metro
+
+# ─── Estado global (carregado uma vez) ────────────────────────────────────────
+_normals: pd.DataFrame | None = None
+_stations: pd.DataFrame | None = None
+_monthly: pd.DataFrame | None = None
+
+
+def load_artifacts():
+    global _normals, _stations, _monthly
+
+    normals_path = DATA_DIR / "climate_normals.pkl"
+    if not normals_path.exists():
+        raise RuntimeError("Dados não encontrados. Execute: python api/preprocess.py")
+
+    # Desvios indefinidos (células de um único ano) recebem os mesmos padrões do treino
+    _normals = pd.read_pickle(normals_path).fillna(STD_DEFAULTS)
+    _stations = pd.read_pickle(DATA_DIR / "stations.pkl")
+    _normals = _normals.merge(_stations[["codigo", "alt"]], on="codigo", how="left")
+    _monthly = pd.read_pickle(DATA_DIR / "monthly_climate.pkl")
+    print("Dados carregados com sucesso.")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    load_artifacts()
+    yield
+
+
+app = FastAPI(title="AgroClima API", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,55 +77,28 @@ app.add_middleware(
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# ─── Estado global (carregado uma vez) ────────────────────────────────────────
-_artifacts = None
-_normals: pd.DataFrame | None = None
-_stations: pd.DataFrame | None = None
-_monthly: pd.DataFrame | None = None
-
-
-def load_artifacts():
-    global _artifacts, _normals, _stations, _monthly
-
-    model_path = MODEL_DIR / "recommendation_model.joblib"
-    normals_path = DATA_DIR / "climate_normals.pkl"
-    stations_path = DATA_DIR / "stations.pkl"
-    monthly_path = DATA_DIR / "monthly_climate.pkl"
-
-    if not model_path.exists():
-        raise RuntimeError(
-            "Modelo não encontrado. Execute: python api/preprocess.py && python api/train_model.py"
-        )
-
-    _artifacts = joblib.load(model_path)
-    _normals = pd.read_pickle(normals_path)
-    _stations = pd.read_pickle(stations_path)
-    _monthly = pd.read_pickle(monthly_path)
-    print("Modelo e dados carregados com sucesso.")
-
-
-@app.on_event("startup")
-def startup():
-    load_artifacts()
-
 
 # ─── Modelos Pydantic ──────────────────────────────────────────────────────────
+
+Mes = Annotated[int, Field(ge=1, le=12)]
+
 
 class RecommendRequest(BaseModel):
     station_code: str
     crop: str
-    months: list[int]   # meses de interesse [1..12]
+    months: list[Mes] = Field(min_length=1)   # meses de interesse [1..12]
 
 
 class MonthResult(BaseModel):
     month: int
     month_name: str
-    score: float
-    temp_media: float
-    precip_total: float
-    umidade_media: float
+    score: Optional[float]
+    temp_media: Optional[float]
+    precip_total: Optional[float]
+    umidade_media: Optional[float]
     status: str
     details: dict
+    fonte: dict
 
 
 class VarAnalysis(BaseModel):
@@ -95,10 +107,13 @@ class VarAnalysis(BaseModel):
     unidade: str
     faixa_otima: str
     faixa_tolerada: str
-    status: str          # "otimo" | "bom" | "atencao" | "critico"
+    status: str          # "otimo" | "atencao" | "critico"
     icone: str
     titulo: str
     explicacao: str
+    mes_referencia: str
+    faixa_observada: str
+
 
 class RecommendResponse(BaseModel):
     station_code: str
@@ -112,10 +127,13 @@ class RecommendResponse(BaseModel):
     months: list[MonthResult]
     best_months: list[str]
     alert: Optional[str]
+    alerts: list[str]
     climate_summary: dict
     crop_profile: dict
     var_analyses: list[VarAnalysis]
     diagnostico: str
+    metodo: str
+    periodo_dados: str
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -125,10 +143,10 @@ MONTH_NAMES = [
     "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
 ]
 
-MONTH_ABBR = [
-    "", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
-    "Jul", "Ago", "Set", "Out", "Nov", "Dez"
-]
+
+def fmt(value: float, nd: int = 1) -> str:
+    """Formata número no padrão brasileiro (88.12 -> '88,1')."""
+    return f"{value:.{nd}f}".replace(".", ",")
 
 
 def score_to_verdict(score: float) -> tuple[str, str]:
@@ -153,6 +171,24 @@ def score_to_status(score: float) -> str:
     if score >= 35:
         return "ruim"
     return "critico"
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Distância em km entre pontos (aceita arrays em lat2/lon2)."""
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dp, dl = p2 - p1, np.radians(lon2) - np.radians(lon1)
+    a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+    return 6371.0 * 2 * np.arcsin(np.sqrt(a))
+
+
+def station_period(station_code: str) -> str:
+    """Anos de dados efetivamente usados para a estação (ex.: '2005-2025, 14 anos')."""
+    if _monthly is None:
+        return ""
+    anos = sorted(_monthly.loc[_monthly["codigo"] == station_code, "year"].unique())
+    if not anos:
+        return "sem dados locais"
+    return f"{anos[0]}-{anos[-1]}, {len(anos)} anos com ao menos um mês completo"
 
 
 # ─── Perfis detalhados das culturas (para explicações) ────────────────────────
@@ -305,365 +341,258 @@ CROP_PROFILES = {
 }
 
 
-def _explain_var(
-    varname: str, value: float, unit: str,
-    req_min: float, req_otmin: float, req_otmax: float, req_max: float,
-    crop_nome: str, crop_key: str, fase_critica: str,
-) -> VarAnalysis:
-    """Gera análise textual detalhada de uma variável climática vs requisito da cultura."""
+# ─── Análise textual por variável ─────────────────────────────────────────────
+# Zonas, coerentes com a nota trapezoidal s:
+#   crítica  : x <= a ou x >= d  (s = 0)
+#   atenção  : a < x < b ou c < x < d  (0 < s < 1)
+#   ótima    : b <= x <= c  (s = 1)
 
-    faixa_ot  = f"{req_otmin}–{req_otmax} {unit}"
-    faixa_tol = f"{req_min}–{req_max} {unit}"
+TEXTOS = {
+    "Temperatura": {
+        "abaixo_limite": ("critico", "🥶", "Temperatura crítica — abaixo do limite",
+            "No histórico, a temperatura média de {v} °C fica {dif} °C abaixo do mínimo absoluto "
+            "adotado para {cultura} ({a} °C). Nesse patamar, a germinação e o crescimento ficam "
+            "muito prejudicados, e há risco de geada."),
+        "abaixo_otimo": ("atencao", "🌡️", "Temperatura abaixo do ideal",
+            "No histórico, a temperatura média de {v} °C está na faixa tolerada, mas {dif} °C abaixo "
+            "da faixa ótima ({otima}). Médias assim tendem a alongar o ciclo e reduzir o potencial "
+            "produtivo; na fase de {fase}, o frio pode causar aborto de flores."),
+        "otimo": ("otimo", "✅", "Temperatura ideal",
+            "No histórico, a temperatura média de {v} °C está dentro da faixa ótima ({otima}) para "
+            "{cultura}, patamar que favorece crescimento e florescimento regulares."),
+        "acima_otimo": ("atencao", "🌡️", "Temperatura acima do ideal",
+            "No histórico, a temperatura média de {v} °C está {dif} °C acima da faixa ótima. A cultura "
+            "tolera esse patamar, mas sob estresse térmico, com mais transpiração e consumo de água; "
+            "na fase de {fase}, o calor pode causar aborto de flores."),
+        "acima_limite": ("critico", "🔥", "Temperatura crítica — calor excessivo",
+            "No histórico, a temperatura média de {v} °C supera o máximo absoluto adotado ({d} °C). "
+            "Nesse patamar há risco de danos fisiológicos graves, como esterilidade do pólen na fase "
+            "de {fase}."),
+    },
+    "Precipitação": {
+        "abaixo_limite": ("critico", "🏜️", "Precipitação insuficiente — risco de seca",
+            "No histórico, a precipitação média de {v} mm fica {dif} mm abaixo do mínimo adotado para "
+            "{cultura} ({a} mm). Com esse déficit, o cultivo de sequeiro dependeria de irrigação "
+            "suplementar."),
+        "abaixo_otimo": ("atencao", "💧", "Precipitação abaixo do ideal",
+            "No histórico, a precipitação média de {v} mm está na faixa tolerada, mas {dif} mm abaixo "
+            "da faixa ótima ({otima}). Veranicos nesse período seriam críticos, sobretudo na fase de "
+            "{fase}."),
+        "otimo": ("otimo", "🌧️", "Precipitação ideal",
+            "No histórico, a precipitação média de {v} mm está dentro da faixa ótima ({otima}) para "
+            "{cultura}, com boa disponibilidade de água no período."),
+        "acima_otimo": ("atencao", "🌦️", "Precipitação elevada",
+            "No histórico, a precipitação média de {v} mm está {dif} mm acima da faixa ótima, ainda "
+            "dentro do tolerável. O excesso de umidade favorece doenças fúngicas e pode dificultar "
+            "plantio e colheita."),
+        "acima_limite": ("critico", "🌊", "Excesso hídrico — risco de encharcamento",
+            "No histórico, a precipitação média de {v} mm ultrapassa o máximo adotado ({d} mm) para "
+            "{cultura}. Esse volume favorece encharcamento, podridões e dificulta o uso de máquinas."),
+    },
+    "Umidade": {
+        "abaixo_limite": ("critico", "🌵", "Umidade crítica — ar muito seco",
+            "No histórico, a umidade relativa média de {v}% fica abaixo do mínimo adotado ({a}%) para "
+            "{cultura}. Ar muito seco aumenta a transpiração e reduz a fotossíntese, sobretudo na fase "
+            "de {fase}."),
+        "abaixo_otimo": ("atencao", "💨", "Umidade abaixo do ideal",
+            "No histórico, a umidade relativa média de {v}% está {dif} pontos percentuais abaixo da "
+            "faixa ótima ({otima}), o que reduz a eficiência fotossintética."),
+        "otimo": ("otimo", "✅", "Umidade ideal",
+            "No histórico, a umidade relativa média de {v}% está dentro da faixa ótima ({otima}) para "
+            "{cultura}."),
+        "acima_otimo": ("atencao", "🌫️", "Umidade elevada",
+            "No histórico, a umidade relativa média de {v}% está {dif} pontos percentuais acima da "
+            "faixa ótima, condição que favorece fungos e pragas."),
+        "acima_limite": ("critico", "🌫️", "Umidade excessiva",
+            "No histórico, a umidade relativa média de {v}% supera o máximo adotado ({d}%) para "
+            "{cultura}, condição muito favorável a doenças fúngicas."),
+    },
+}
 
-    # ── Temperatura ──────────────────────────────────────────────────────────
-    if varname == "Temperatura":
-        if value < req_min:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="critico", icone="🥶", titulo="Temperatura crítica — abaixo do limite",
-                explicacao=(
-                    f"A temperatura média de {value:.1f}°C está {req_min - value:.1f}°C abaixo "
-                    f"do mínimo absoluto tolerado pela {crop_nome} ({req_min}°C). Nessa faixa, "
-                    f"a germinação é praticamente inviável e o crescimento cessa. "
-                    f"Risco de geadas que podem destruir completamente a lavoura."
-                ),
-            )
-        if value < req_otmin:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="atencao", icone="🌡️", titulo="Temperatura abaixo do ideal",
-                explicacao=(
-                    f"A temperatura média de {value:.1f}°C está dentro da faixa tolerada, mas "
-                    f"{req_otmin - value:.1f}°C abaixo da zona ótima ({faixa_ot}). "
-                    f"O crescimento é mais lento, o ciclo se prolonga e a produtividade fica "
-                    f"comprometida. Na fase de {fase_critica}, temperaturas baixas "
-                    f"podem causar aborto de flores e redução no número de grãos."
-                ),
-            )
-        if value <= req_otmax:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="otimo", icone="✅", titulo="Temperatura ideal",
-                explicacao=(
-                    f"A temperatura média de {value:.1f}°C está exatamente dentro da faixa ótima "
-                    f"({faixa_ot}) para {crop_nome}. Essa condição favorece o crescimento "
-                    f"acelerado, florescimento regular e boa produtividade. "
-                    f"A fase de {fase_critica} ocorrerá sob condições térmicas favoráveis."
-                ),
-            )
-        if value <= req_max:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="atencao", icone="🌡️", titulo="Temperatura acima do ideal",
-                explicacao=(
-                    f"A temperatura média de {value:.1f}°C está {value - req_otmax:.1f}°C acima "
-                    f"da faixa ótima. A {crop_nome} tolera essa condição, mas sob estresse "
-                    f"térmico: o metabolismo acelera, aumenta a transpiração e o consumo hídrico. "
-                    f"No {fase_critica}, o calor excessivo pode causar aborto de flores "
-                    f"e redução na qualidade dos grãos ou frutos."
-                ),
-            )
-        return VarAnalysis(
-            variavel=varname, valor=round(value,1), unidade=unit,
-            faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-            status="critico", icone="🔥", titulo="Temperatura crítica — calor excessivo",
-            explicacao=(
-                f"A temperatura média de {value:.1f}°C supera o limite máximo tolerado "
-                f"({req_max}°C) pela {crop_nome}. Nessa faixa ocorrem danos fisiológicos "
-                f"graves: desnaturação de enzimas, esterilidade do pólen durante o "
-                f"{fase_critica} e murcha permanente. A produtividade será severamente comprometida."
-            ),
-        )
+SEVERIDADE = {"critico": 2, "atencao": 1, "otimo": 0}
 
-    # ── Precipitação ─────────────────────────────────────────────────────────
-    if varname == "Precipitação":
-        if value < req_min:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="critico", icone="🏜️", titulo="Precipitação insuficiente — risco de seca",
-                explicacao=(
-                    f"A precipitação média de {value:.1f}mm está {req_min - value:.1f}mm abaixo "
-                    f"do mínimo necessário para {crop_nome} ({req_min}mm). Esse nível de déficit "
-                    f"hídrico compromete a germinação e o estabelecimento da cultura. "
-                    f"Será necessária irrigação suplementar para viabilizar o cultivo nesse período."
-                ),
-            )
-        if value < req_otmin:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="atencao", icone="💧", titulo="Precipitação abaixo do ideal",
-                explicacao=(
-                    f"Com {value:.1f}mm de precipitação média, a {crop_nome} consegue se "
-                    f"desenvolver, mas {req_otmin - value:.1f}mm a menos que o ideal "
-                    f"({faixa_ot}). Períodos de veranico (mais de 15 dias sem chuva) "
-                    f"nessa fase podem ser críticos, especialmente no {fase_critica}. "
-                    f"Monitorar a umidade do solo é essencial."
-                ),
-            )
-        if value <= req_otmax:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="otimo", icone="🌧️", titulo="Precipitação ideal",
-                explicacao=(
-                    f"A precipitação média de {value:.1f}mm está dentro da faixa ótima "
-                    f"({faixa_ot}) para {crop_nome}. O balanço hídrico é favorável, "
-                    f"garantindo boa disponibilidade de água no solo durante todo o ciclo. "
-                    f"O {fase_critica} ocorrerá com suprimento hídrico adequado."
-                ),
-            )
-        if value <= req_max:
-            return VarAnalysis(
-                variavel=varname, valor=round(value,1), unidade=unit,
-                faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-                status="atencao", icone="🌦️", titulo="Precipitação elevada",
-                explicacao=(
-                    f"A precipitação média de {value:.1f}mm está {value - req_otmax:.1f}mm acima "
-                    f"do ideal, mas ainda dentro do tolerável. O excesso de umidade aumenta o "
-                    f"risco de doenças fúngicas (como ferrugem e míldio) e pode dificultar "
-                    f"operações de plantio e colheita. Atenção ao sistema de drenagem."
-                ),
-            )
-        return VarAnalysis(
-            variavel=varname, valor=round(value,1), unidade=unit,
-            faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-            status="critico", icone="🌊", titulo="Excesso hídrico — risco de encharcamento",
-            explicacao=(
-                f"Com {value:.1f}mm de precipitação média, o volume de chuvas ultrapassa "
-                f"o limite máximo tolerado ({req_max}mm) pela {crop_nome}. O encharcamento "
-                f"do solo prejudica a aeração das raízes, favorece podridões e doenças, "
-                f"e inviabiliza o uso de maquinário no campo. Não recomendado nesse período."
-            ),
-        )
 
-    # ── Umidade ──────────────────────────────────────────────────────────────
-    if value < req_min:
-        return VarAnalysis(
-            variavel=varname, valor=round(value,1), unidade=unit,
-            faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-            status="critico", icone="🌵", titulo="Umidade crítica — ar muito seco",
-            explicacao=(
-                f"A umidade relativa média de {value:.1f}% está abaixo do mínimo tolerado "
-                f"({req_min}%) pela {crop_nome}. Ar muito seco aumenta drasticamente a "
-                f"transpiração das folhas, causando murcha, fechamento dos estômatos e "
-                f"redução da fotossíntese. O período de {fase_critica} sob "
-                f"baixa umidade compromete a produção de forma significativa."
-            ),
-        )
-    if value < req_otmin:
-        return VarAnalysis(
-            variavel=varname, valor=round(value,1), unidade=unit,
-            faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-            status="atencao", icone="💨", titulo="Umidade abaixo do ideal",
-            explicacao=(
-                f"A umidade relativa de {value:.1f}% está {req_otmin - value:.1f}% abaixo "
-                f"da faixa ótima ({faixa_ot}). A planta enfrenta estresse hídrico "
-                f"moderado pelo ar, o que reduz a eficiência fotossintética e pode "
-                f"prejudicar a polinização natural durante o {fase_critica}."
-            ),
-        )
-    if value <= req_otmax:
-        return VarAnalysis(
-            variavel=varname, valor=round(value,1), unidade=unit,
-            faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-            status="otimo", icone="✅", titulo="Umidade ideal",
-            explicacao=(
-                f"A umidade relativa de {value:.1f}% está dentro da faixa ótima "
-                f"({faixa_ot}) para {crop_nome}. Essa condição favorece a abertura "
-                f"regular dos estômatos, boa eficiência fotossintética e "
-                f"polinização bem-sucedida no {fase_critica}."
-            ),
-        )
-    if value <= req_max:
-        return VarAnalysis(
-            variavel=varname, valor=round(value,1), unidade=unit,
-            faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-            status="atencao", icone="🌫️", titulo="Umidade elevada",
-            explicacao=(
-                f"A umidade relativa de {value:.1f}% está {value - req_otmax:.1f}% acima "
-                f"da faixa ótima. Alta umidade aumenta o risco de proliferação de fungos, "
-                f"bactérias e pragas que se desenvolvem melhor em ambientes úmidos. "
-                f"Atenção ao monitoramento fitossanitário da lavoura."
-            ),
-        )
+def _zona(x: float, a: float, b: float, c: float, d: float) -> tuple[str, float]:
+    """Retorna a zona textual e a distância até a faixa ótima."""
+    if x <= a:
+        return "abaixo_limite", a - x
+    if x < b:
+        return "abaixo_otimo", b - x
+    if x <= c:
+        return "otimo", 0.0
+    if x < d:
+        return "acima_otimo", x - c
+    return "acima_limite", x - d
+
+
+def _explain_var(varname: str, unit: str, req: tuple, valores: dict[int, float],
+                 crop_nome: str, fase_critica: str) -> VarAnalysis | None:
+    """
+    Analisa uma variável mês a mês e reporta o pior mês selecionado,
+    em vez da média dos meses (que esconderia riscos opostos).
+    """
+    a, b, c, d = req
+    if not valores:
+        return None
+
+    avaliados = []
+    for m, x in valores.items():
+        zona, dif = _zona(x, a, b, c, d)
+        status = TEXTOS[varname][zona][0]
+        avaliados.append((SEVERIDADE[status], dif, m, x, zona))
+    _, dif, mes, valor, zona = max(avaliados)
+
+    status, icone, titulo, texto = TEXTOS[varname][zona]
+    sep = "" if unit == "%" else " "
+    explicacao = texto.format(
+        v=fmt(valor), dif=fmt(dif), a=a, d=d, cultura=crop_nome, fase=fase_critica,
+        otima=f"{b}–{c}{sep}{unit}",
+    )
+    if len(valores) > 1:
+        explicacao = f"Pior mês selecionado: {MONTH_NAMES[mes]}. " + explicacao
+
+    lo, hi = min(valores.values()), max(valores.values())
     return VarAnalysis(
-        variavel=varname, valor=round(value,1), unidade=unit,
-        faixa_otima=faixa_ot, faixa_tolerada=faixa_tol,
-        status="critico", icone="🌫️", titulo="Umidade excessiva",
-        explicacao=(
-            f"Com {value:.1f}% de umidade relativa, o ambiente é excessivamente úmido "
-            f"para {crop_nome}. Condição altamente favorável a doenças fúngicas graves "
-            f"como ferrugem, míldio e botrytis, que podem dizimar lavouras inteiras. "
-            f"A qualidade pós-colheita também é comprometida."
-        ),
+        variavel=varname, valor=round(valor, 1), unidade=unit,
+        faixa_otima=f"{b}–{c}{sep}{unit}", faixa_tolerada=f"{a}–{d}{sep}{unit}",
+        status=status, icone=icone, titulo=titulo, explicacao=explicacao,
+        mes_referencia=MONTH_NAMES[mes],
+        faixa_observada=f"{fmt(lo)}–{fmt(hi)}{sep}{unit}" if len(valores) > 1 else f"{fmt(lo)}{sep}{unit}",
     )
 
 
-def _diagnostico(
-    crop_nome: str, crop_key: str, overall: float,
-    verdict: str, station_name: str, uf: str,
-    months_sel: list[int], analyses: list[VarAnalysis],
-    best_months: list[str],
-) -> str:
-    """Gera parágrafo de diagnóstico climático consolidado."""
+def _diagnostico(crop_nome: str, crop_key: str, overall: float, station_name: str, uf: str,
+                 months_sel: list[int], analyses: list[VarAnalysis], best_months: list[str],
+                 inviaveis: list[str], periodo: str) -> str:
+    """Gera parágrafo de diagnóstico climático consolidado, em linguagem histórica."""
     meses_str = ", ".join(MONTH_NAMES[m] for m in months_sel)
-    profile = CROP_PROFILES.get(crop_key, {})
-    regioes = profile.get("regioes", "")
+    regioes = CROP_PROFILES.get(crop_key, {}).get("regioes", "")
+
+    if overall >= 80:
+        nivel = "**altamente favorável**"
+    elif overall >= 65:
+        nivel = "**favorável**"
+    elif overall >= 50:
+        nivel = "**moderada**"
+    elif overall >= 35:
+        nivel = "**de risco elevado**"
+    else:
+        nivel = "**não recomendada**"
+
+    partes = [
+        f"No histórico de {station_name}/{uf} ({periodo}), a adequação climática média de "
+        f"{meses_str} para {crop_nome} foi {nivel}, com {fmt(overall)} pontos de 0 a 100."
+    ]
 
     criticos = [a for a in analyses if a.status == "critico"]
     atencoes = [a for a in analyses if a.status == "atencao"]
-    otimos   = [a for a in analyses if a.status == "otimo"]
-
-    partes = []
-
-    # Parágrafo 1 — diagnóstico geral
-    if overall >= 80:
-        partes.append(
-            f"A análise climática de {station_name}/{uf} para o período de {meses_str} "
-            f"indica condições **altamente favoráveis** ao cultivo de {crop_nome}. "
-            f"O histórico meteorológico da estação alinha-se muito bem com os requisitos agronômicos da cultura."
-        )
-    elif overall >= 65:
-        partes.append(
-            f"O período de {meses_str} em {station_name}/{uf} apresenta condições "
-            f"**favoráveis** ao cultivo de {crop_nome}, com a maioria das variáveis climáticas "
-            f"dentro das faixas recomendadas pela literatura agronômica."
-        )
-    elif overall >= 50:
-        partes.append(
-            f"As condições climáticas de {station_name}/{uf} no período de {meses_str} "
-            f"são **moderadas** para o cultivo de {crop_nome}. A viabilidade existe, "
-            f"mas exige cuidados adicionais e manejo intensivo para mitigar os riscos identificados."
-        )
-    elif overall >= 35:
-        partes.append(
-            f"A análise indica **risco elevado** para o cultivo de {crop_nome} em "
-            f"{station_name}/{uf} no período de {meses_str}. "
-            f"Variáveis climáticas importantes estão fora das faixas ideais, exigindo "
-            f"infraestrutura de suporte significativa (irrigação, proteção térmica etc.)."
-        )
-    else:
-        partes.append(
-            f"O período de {meses_str} em {station_name}/{uf} apresenta condições "
-            f"**não recomendadas** para o cultivo de {crop_nome}. "
-            f"O histórico climático da região é incompatível com os requisitos fundamentais da cultura."
-        )
-
-    # Parágrafo 2 — variáveis críticas
     if criticos:
-        nomes = " e ".join(a.variavel.lower() for a in criticos)
-        partes.append(
-            f"O principal fator limitante identificado é a {nomes}: "
-            f"{criticos[0].explicacao.split('.')[0]}."
-        )
+        itens = "; ".join(f"{a.variavel.lower()} em {a.mes_referencia} ({fmt(a.valor)} {a.unidade}, "
+                          f"faixa tolerada {a.faixa_tolerada})" for a in criticos)
+        partes.append(f"Fatores fora dos limites absolutos: {itens}.")
     elif atencoes:
         nomes = " e ".join(a.variavel.lower() for a in atencoes)
+        verbo = "ficaram" if len(atencoes) > 1 else "ficou"
+        partes.append(f"{nomes.capitalize()} {verbo} fora da faixa ótima, mas dentro do tolerável.")
+
+    if inviaveis:
         partes.append(
-            f"Atenção especial é necessária para {nomes}, "
-            f"que estão fora da faixa ótima mas dentro do tolerável."
+            f"Os meses {', '.join(inviaveis)} têm ao menos uma variável fora dos limites absolutos "
+            f"e por isso foram marcados como inviáveis e contam como 0 na pontuação geral, mesmo que a "
+            f"soma ponderada dê nota positiva."
         )
 
-    # Parágrafo 3 — comparação com regiões tradicionais
     if regioes:
-        partes.append(
-            f"As principais regiões produtoras de {crop_nome} no Brasil são: {regioes}. "
-            f"{'Essa estação está climaticamente próxima dessas regiões.' if overall >= 65 else 'O clima dessa estação difere significativamente dessas regiões.'}"
-        )
+        partes.append(f"Como referência, as principais regiões produtoras de {crop_nome} no Brasil são: {regioes}.")
 
-    # Parágrafo 4 — melhores meses
     if best_months:
         partes.append(
-            f"Com base nos dados históricos do INMET, os meses mais favoráveis para "
-            f"{crop_nome} nessa estação são: {', '.join(best_months[:3])}."
+            f"No ano inteiro, os meses de clima mensal mais adequado nessa estação foram: "
+            f"{', '.join(best_months[:3])}. Isso não equivale a data de semeadura, que depende "
+            f"do ciclo da cultura e do ZARC."
         )
 
     return " ".join(partes)
 
 
-def predict_score(station_row: pd.Series, month: int, crop: str) -> float:
-    """Usa o modelo ML para prever o score de aptidão."""
-    artifacts = _artifacts
-    model = artifacts["model"]
-    le_uf = artifacts["le_uf"]
-    le_regiao = artifacts["le_regiao"]
-    le_crop = artifacts["le_crop"]
+# ─── Dados e pontuação ────────────────────────────────────────────────────────
 
-    uf = station_row.get("uf", "XX")
-    regiao = station_row.get("regiao", "XX")
+def lookup_normal(station_row: pd.Series, month: int) -> tuple[pd.Series | None, dict]:
+    """
+    Indicador do mês para a estação. Sem indicador local, escolhe, para este mês,
+    a estação mais próxima (Haversine) com pelo menos VIZINHA_MIN_ANOS anos e diferença
+    de altitude até VIZINHA_MAX_DALT_M, dentro de VIZINHA_MAX_KM; empate de distância
+    fica com quem tem mais anos. As temperaturas são corrigidas pela altitude.
+    """
+    code = station_row["codigo"]
+    rows = _normals[(_normals["codigo"] == code) & (_normals["month"] == month)]
+    if len(rows) > 0:
+        return rows.iloc[0], {"tipo": "estacao", "codigo": code}
 
-    try:
-        uf_enc = le_uf.transform([uf])[0]
-    except ValueError:
-        uf_enc = 0
+    alt_alvo = float(station_row.get("alt", 0) or 0)
+    cand = _normals[(_normals["month"] == month) & (_normals["codigo"] != code)
+                    & (_normals["n_anos"] >= VIZINHA_MIN_ANOS)
+                    & ((_normals["alt"] - alt_alvo).abs() <= VIZINHA_MAX_DALT_M)].copy()
+    if len(cand) > 0:
+        cand["dist"] = haversine_km(float(station_row["lat"]), float(station_row["lon"]),
+                                    cand["lat"].astype(float).values, cand["lon"].astype(float).values)
+        cand = cand[cand["dist"] <= VIZINHA_MAX_KM].sort_values(["dist", "n_anos", "codigo"],
+                                                                ascending=[True, False, True])
+        if len(cand) > 0:
+            r = cand.iloc[0].copy()
+            dalt = alt_alvo - float(r["alt"])
+            for c in ("temp_norm", "temp_max_norm", "temp_min_norm"):
+                r[c] = float(r[c]) - GRADIENTE_TERMICO * dalt
+            return r, {"tipo": "vizinha", "codigo": r["codigo"], "nome": r["nome"],
+                       "distancia_km": round(float(r["dist"]), 1),
+                       "dif_altitude_m": round(dalt), "n_anos": int(r["n_anos"])}
 
-    try:
-        regiao_enc = le_regiao.transform([regiao])[0]
-    except ValueError:
-        regiao_enc = 0
-
-    try:
-        crop_enc = le_crop.transform([crop])[0]
-    except ValueError:
-        raise HTTPException(400, f"Cultura '{crop}' não reconhecida.")
-
-    lat = float(station_row.get("lat", 0))
-    lon = float(station_row.get("lon", 0))
-
-    # Pega normais do mês
-    norm_row = _normals[
-        (_normals["codigo"] == station_row["codigo"]) &
-        (_normals["month"] == month)
-    ]
-
-    if len(norm_row) == 0:
-        # Estação sem dados para esse mês — usa vizinha mais próxima por UF
-        fallback = _normals[_normals["uf"] == uf][_normals["month"] == month]
-        if len(fallback) == 0:
-            return 50.0
-        norm_row = fallback.mean(numeric_only=True).to_frame().T
-        norm_row["month"] = month
-
-    nr = norm_row.iloc[0]
-    features = np.array([[
-        lat, lon, month, crop_enc, uf_enc, regiao_enc,
-        nr.get("temp_norm", 25), nr.get("temp_std", 2),
-        nr.get("temp_max_norm", 30), nr.get("temp_min_norm", 18),
-        nr.get("precip_norm", 100), nr.get("precip_std", 30),
-        nr.get("umidade_norm", 70), nr.get("umidade_std", 8),
-        nr.get("n_anos", 5),
-    ]])
-
-    score = float(model.predict(features)[0])
-    return max(0.0, min(100.0, score))
+    return None, {"tipo": "indisponivel"}
 
 
-def get_climate_for_month(station_code: str, month: int) -> dict:
-    """Retorna dados climáticos históricos de um mês para uma estação."""
-    if _normals is None:
-        return {}
-    rows = _normals[(_normals["codigo"] == station_code) & (_normals["month"] == month)]
-    if len(rows) == 0:
-        return {}
-    r = rows.iloc[0]
-    return {
-        "temp_media": round(float(r.get("temp_norm", 0)), 1),
-        "temp_max": round(float(r.get("temp_max_norm", 0)), 1),
-        "temp_min": round(float(r.get("temp_min_norm", 0)), 1),
-        "precip_total": round(float(r.get("precip_norm", 0)), 1),
-        "precip_std": round(float(r.get("precip_std", 0)), 1),
-        "umidade_media": round(float(r.get("umidade_norm", 0)), 1),
-        "n_anos": int(r.get("n_anos", 0)),
-    }
+def month_result(station_row: pd.Series, month: int, crop: str) -> MonthResult:
+    """Pontua um mês pela regra e devolve a decomposição completa."""
+    r, fonte = lookup_normal(station_row, month)
+    if r is None:
+        return MonthResult(month=month, month_name=MONTH_NAMES[month], score=None,
+                           temp_media=None, precip_total=None, umidade_media=None,
+                           status="sem_dados", details={}, fonte=fonte)
+
+    b = score_breakdown(r, crop)
+    formula = (
+        f"100 × (0,35×{fmt(b['s_temp'], 2)} + 0,40×{fmt(b['s_precip'], 2)} + 0,25×{fmt(b['s_umid'], 2)})"
+        f" × {fmt(b['bonus'])} × {fmt(b['pen_precip'], 2)} × {fmt(b['pen_temp'], 2)} = {fmt(b['score'])}"
+    )
+    return MonthResult(
+        month=month,
+        month_name=MONTH_NAMES[month],
+        score=b["score"],
+        temp_media=round(float(r["temp_norm"]), 1),
+        precip_total=round(float(r["precip_norm"]), 1),
+        umidade_media=round(float(r["umidade_norm"]), 1),
+        status="inviavel" if b["veto"] else score_to_status(b["score"]),
+        details={
+            "temp_max": round(float(r["temp_max_norm"]), 1),
+            "temp_min": round(float(r["temp_min_norm"]), 1),
+            "precip_std": round(float(r["precip_std"]), 1),
+            "temp_std": round(float(r["temp_std"]), 2),
+            "n_anos": int(r["n_anos"]),
+            "s_temp": round(b["s_temp"], 3),
+            "s_precip": round(b["s_precip"], 3),
+            "s_umid": round(b["s_umid"], 3),
+            "base": round(b["base"], 3),
+            "bonus": b["bonus"],
+            "pen_precip": round(b["pen_precip"], 3),
+            "pen_temp": round(b["pen_temp"], 3),
+            "veto": b["veto"],
+            "formula": formula,
+        },
+        fonte=fonte,
+    )
 
 
 def get_annual_series(station_code: str) -> dict:
-    """Retorna série mensal anual (normais) para a estação."""
+    """Retorna série mensal anual (indicadores) para a estação."""
     if _normals is None:
         return {}
     rows = _normals[_normals["codigo"] == station_code].sort_values("month")
@@ -671,10 +600,113 @@ def get_annual_series(station_code: str) -> dict:
         return {}
     return {
         "months": rows["month"].tolist(),
-        "temp": [round(v, 1) for v in rows["temp_norm"].fillna(0).tolist()],
-        "precip": [round(v, 1) for v in rows["precip_norm"].fillna(0).tolist()],
-        "umidade": [round(v, 1) for v in rows["umidade_norm"].fillna(0).tolist()],
+        "temp": [round(v, 1) for v in rows["temp_norm"].tolist()],
+        "precip": [round(v, 1) for v in rows["precip_norm"].tolist()],
+        "umidade": [round(v, 1) for v in rows["umidade_norm"].tolist()],
     }
+
+
+def build_alerts(months_data: list[MonthResult], crop_info: dict) -> list[str]:
+    """Alertas de todos os meses com variável fora dos limites absolutos."""
+    alerts = []
+    nome = crop_info["nome"]
+    for md in months_data:
+        if md.score is None:
+            alerts.append(f"{md.month_name}: sem indicador da estação nem de vizinha a até "
+                          f"{VIZINHA_MAX_KM:.0f} km — mês não pontuado.")
+            continue
+        t_min, _, _, t_max = crop_info["temp"]
+        p_min, _, _, p_max = crop_info["precip"]
+        u_min, _, _, u_max = crop_info["umidade"]
+        if md.temp_media >= t_max:
+            alerts.append(f"{md.month_name}: temperatura média de {fmt(md.temp_media)} °C, acima do máximo de {t_max} °C para {nome}.")
+        if md.temp_media <= t_min:
+            alerts.append(f"{md.month_name}: temperatura média de {fmt(md.temp_media)} °C, abaixo do mínimo de {t_min} °C para {nome}.")
+        if md.precip_total <= p_min:
+            alerts.append(f"{md.month_name}: precipitação de {fmt(md.precip_total)} mm, abaixo do mínimo de {p_min} mm — risco de déficit hídrico.")
+        if md.precip_total >= p_max:
+            alerts.append(f"{md.month_name}: precipitação de {fmt(md.precip_total)} mm, acima do máximo de {p_max} mm — risco de excesso hídrico.")
+        if md.umidade_media <= u_min or md.umidade_media >= u_max:
+            alerts.append(f"{md.month_name}: umidade de {fmt(md.umidade_media)}%, fora da faixa tolerada de {u_min}–{u_max}%.")
+        if md.fonte.get("tipo") == "vizinha":
+            f = md.fonte
+            alerts.append(f"{md.month_name}: sem indicador local; usados os dados da estação vizinha "
+                          f"{f['nome']} ({f['codigo']}), a {fmt(f['distancia_km'])} km, com {f['n_anos']} anos "
+                          f"e temperaturas corrigidas por {f['dif_altitude_m']:+d} m de altitude.")
+    return alerts
+
+
+def build_recommendation(req: RecommendRequest) -> RecommendResponse:
+    """Gera recomendação de plantio para uma estação, cultura e período."""
+    if _normals is None or _stations is None:
+        raise HTTPException(500, "Dados não carregados.")
+
+    station = _stations[_stations["codigo"] == req.station_code]
+    if len(station) == 0:
+        raise HTTPException(404, f"Estação '{req.station_code}' não encontrada.")
+    if req.crop not in CROP_REQUIREMENTS:
+        raise HTTPException(400, f"Cultura '{req.crop}' não suportada.")
+
+    st = station.iloc[0]
+    crop_info = CROP_REQUIREMENTS[req.crop]
+    meses = sorted(set(req.months))
+
+    months_data = [month_result(st, m, req.crop) for m in meses]
+    # A trava de inviabilidade também vale para o resumo: mês inviável entra com 0 na média
+    scores = [0.0 if md.status == "inviavel" else md.score for md in months_data if md.score is not None]
+    if not scores:
+        raise HTTPException(422, "Não há dados para nenhum dos meses selecionados nesta estação.")
+
+    overall = round(float(np.mean(scores)), 1)
+    verdict, color = score_to_verdict(overall)
+
+    # Melhores meses do ano: maiores pontuações, sem veto, com pelo menos 60 pontos
+    ano = [month_result(st, m, req.crop) for m in range(1, 13)]
+    candidatos = [r for r in ano if r.score is not None and not r.details["veto"] and r.score >= 60]
+    best_months = [r.month_name for r in sorted(candidatos, key=lambda r: r.score, reverse=True)[:4]]
+
+    alerts = build_alerts(months_data, crop_info)
+    inviaveis = [md.month_name for md in months_data if md.status == "inviavel"]
+
+    profile = CROP_PROFILES.get(req.crop, {})
+    fase = profile.get("fase_critica", "florescimento")
+    validos = [md for md in months_data if md.score is not None]
+    var_analyses = [
+        _explain_var(nome, unid, crop_info[chave], {md.month: getattr(md, campo) for md in validos},
+                     crop_info["nome"], fase)
+        for nome, unid, chave, campo in [
+            ("Temperatura", "°C", "temp", "temp_media"),
+            ("Precipitação", "mm", "precip", "precip_total"),
+            ("Umidade", "%", "umidade", "umidade_media"),
+        ]
+    ]
+
+    periodo = station_period(req.station_code)
+    diagnostico = _diagnostico(
+        crop_info["nome"], req.crop, overall, str(st.get("nome", "")), str(st.get("uf", "")),
+        meses, var_analyses, best_months, inviaveis, periodo,
+    )
+
+    return RecommendResponse(
+        station_code=req.station_code,
+        station_name=str(st.get("nome", "")),
+        uf=str(st.get("uf", "")),
+        crop=req.crop,
+        crop_name=crop_info["nome"],
+        overall_score=overall,
+        verdict=verdict,
+        verdict_color=color,
+        months=months_data,
+        best_months=best_months,
+        alert=alerts[0] if alerts else None,
+        alerts=alerts,
+        climate_summary=get_annual_series(req.station_code),
+        crop_profile=profile,
+        var_analyses=var_analyses,
+        diagnostico=diagnostico,
+        metodo="Regra trapezoidal aplicada diretamente (AgroClima 1.1)",
+        periodo_dados=periodo,
+    )
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -697,8 +729,8 @@ async def get_stations(uf: Optional[str] = None, search: Optional[str] = None):
     if uf:
         df = df[df["uf"].str.upper() == uf.upper()]
     if search:
-        mask = df["nome"].str.contains(search.upper(), case=False, na=False)
-        df = df[mask]
+        # Busca literal: caracteres como "[" não são interpretados como expressão regular
+        df = df[df["nome"].str.contains(search, case=False, na=False, regex=False)]
 
     df = df.sort_values(["uf", "nome"])
     return df.fillna("").to_dict(orient="records")
@@ -707,17 +739,9 @@ async def get_stations(uf: Optional[str] = None, search: Optional[str] = None):
 @app.get("/api/crops")
 async def get_crops():
     """Lista as culturas disponíveis."""
-    if _artifacts is None:
-        raise HTTPException(500, "Modelo não carregado.")
-    crops = _artifacts["crop_requirements"]
     return [
-        {
-            "key": k,
-            "nome": v["nome"],
-            "emoji": v["emoji"],
-            "desc": v["desc"],
-        }
-        for k, v in crops.items()
+        {"key": k, "nome": v["nome"], "emoji": v["emoji"], "desc": v["desc"]}
+        for k, v in CROP_REQUIREMENTS.items()
     ]
 
 
@@ -731,7 +755,6 @@ async def get_climate(station_code: str):
     if len(station) == 0:
         raise HTTPException(404, f"Estação {station_code} não encontrada.")
 
-    series = get_annual_series(station_code)
     st = station.iloc[0]
     return {
         "codigo": station_code,
@@ -739,148 +762,38 @@ async def get_climate(station_code: str):
         "uf": st.get("uf", ""),
         "lat": float(st.get("lat", 0)),
         "lon": float(st.get("lon", 0)),
-        "series": series,
+        "periodo": station_period(station_code),
+        "series": get_annual_series(station_code),
     }
 
 
 @app.post("/api/recommend", response_model=RecommendResponse)
 async def recommend(req: RecommendRequest):
     """Gera recomendação de plantio para uma estação, cultura e período."""
-    if _artifacts is None or _stations is None:
-        raise HTTPException(500, "Modelo não carregado.")
-
-    station = _stations[_stations["codigo"] == req.station_code]
-    if len(station) == 0:
-        raise HTTPException(404, f"Estação '{req.station_code}' não encontrada.")
-
-    crop_reqs = _artifacts["crop_requirements"]
-    if req.crop not in crop_reqs:
-        raise HTTPException(400, f"Cultura '{req.crop}' não suportada.")
-
-    st = station.iloc[0]
-    crop_info = crop_reqs[req.crop]
-
-    months_data = []
-    scores = []
-
-    for m in sorted(set(req.months)):
-        if m < 1 or m > 12:
-            continue
-        score = predict_score(st, m, req.crop)
-        climate = get_climate_for_month(req.station_code, m)
-        scores.append(score)
-
-        months_data.append(MonthResult(
-            month=m,
-            month_name=MONTH_NAMES[m],
-            score=round(score, 1),
-            temp_media=climate.get("temp_media", 0),
-            precip_total=climate.get("precip_total", 0),
-            umidade_media=climate.get("umidade_media", 0),
-            status=score_to_status(score),
-            details={
-                "temp_max": climate.get("temp_max", 0),
-                "temp_min": climate.get("temp_min", 0),
-                "precip_std": climate.get("precip_std", 0),
-                "n_anos": climate.get("n_anos", 0),
-            },
-        ))
-
-    if not scores:
-        raise HTTPException(400, "Nenhum mês válido fornecido.")
-
-    overall = round(float(np.mean(scores)), 1)
-    verdict, color = score_to_verdict(overall)
-
-    # Calcula os melhores meses do ano para essa cultura nessa estação
-    all_scores = {}
-    for m in range(1, 13):
-        s = predict_score(st, m, req.crop)
-        all_scores[m] = s
-
-    best = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)[:4]
-    best_months = [MONTH_NAMES[m] for m, _ in best if all_scores[m] >= 60]
-
-    # Alerta específico
-    alert = None
-    req_temp = crop_info["temp"]
-    req_precip = crop_info["precip"]
-    for md in months_data:
-        if md.temp_media > req_temp[3]:
-            alert = f"Temperatura média ({md.temp_media}°C) acima do limite para {crop_info['nome']} em {md.month_name}."
-            break
-        if md.precip_total < req_precip[0]:
-            alert = f"Precipitação baixa ({md.precip_total}mm) em {md.month_name} — risco de déficit hídrico."
-            break
-        if md.precip_total > req_precip[3]:
-            alert = f"Precipitação elevada ({md.precip_total}mm) em {md.month_name} — risco de excesso hídrico."
-            break
-
-    climate_summary = get_annual_series(req.station_code)
-
-    # Médias das variáveis nos meses selecionados
-    avg_temp    = float(np.mean([m.temp_media    for m in months_data])) if months_data else 25.0
-    avg_precip  = float(np.mean([m.precip_total  for m in months_data])) if months_data else 100.0
-    avg_umidade = float(np.mean([m.umidade_media for m in months_data])) if months_data else 70.0
-
-    req_t = crop_info["temp"]
-    req_p = crop_info["precip"]
-    req_u = crop_info["umidade"]
-    profile = CROP_PROFILES.get(req.crop, {})
-    fase = profile.get("fase_critica", "florescimento")
-
-    var_analyses = [
-        _explain_var("Temperatura",  avg_temp,    "°C", *req_t, crop_info["nome"], req.crop, fase),
-        _explain_var("Precipitação", avg_precip,  "mm", *req_p, crop_info["nome"], req.crop, fase),
-        _explain_var("Umidade",      avg_umidade, "%",  *req_u, crop_info["nome"], req.crop, fase),
-    ]
-
-    diagnostico = _diagnostico(
-        crop_info["nome"], req.crop, overall, verdict,
-        str(st.get("nome", "")), str(st.get("uf", "")),
-        sorted(set(req.months)), var_analyses, best_months,
-    )
-
-    return RecommendResponse(
-        station_code=req.station_code,
-        station_name=str(st.get("nome", "")),
-        uf=str(st.get("uf", "")),
-        crop=req.crop,
-        crop_name=crop_info["nome"],
-        overall_score=overall,
-        verdict=verdict,
-        verdict_color=color,
-        months=months_data,
-        best_months=best_months,
-        alert=alert,
-        climate_summary=climate_summary,
-        crop_profile=profile,
-        var_analyses=var_analyses,
-        diagnostico=diagnostico,
-    )
+    return build_recommendation(req)
 
 
 @app.get("/api/stats")
 async def get_stats():
-    """Retorna estatísticas do sistema."""
+    """Retorna estatísticas do sistema, calculadas a partir da base carregada."""
     n_stations = len(_stations) if _stations is not None else 0
     n_records = len(_monthly) if _monthly is not None else 0
     n_normals = len(_normals) if _normals is not None else 0
-    n_crops = len(_artifacts["crop_requirements"]) if _artifacts else 0
     ufs = sorted(_stations["uf"].dropna().unique().tolist()) if _stations is not None else []
+    anos = sorted(int(a) for a in _monthly["year"].unique()) if _monthly is not None else []
     return {
         "estacoes": n_stations,
         "registros_mensais": n_records,
         "normais_climaticas": n_normals,
-        "culturas": n_crops,
+        "culturas": len(CROP_REQUIREMENTS),
         "estados": ufs,
-        "anos": ["2005", "2007-2009", "2013", "2020-2026"],
+        "anos": anos,
     }
 
 
 @app.get("/api/recommend/stream")
 async def recommend_stream(station_code: str, crop: str, months: str):
-    """Endpoint SSE que transmite o progresso real da análise passo a passo."""
+    """Endpoint SSE que transmite as etapas reais da análise, sem pausas simuladas."""
 
     def evt(step: str, msg: str, detail: str = "", data: dict | None = None) -> str:
         obj = {"step": step, "msg": msg, "detail": detail}
@@ -891,142 +804,56 @@ async def recommend_stream(station_code: str, crop: str, months: str):
     async def generate():
         t0 = time.time()
         try:
-            months_list = [int(m.strip()) for m in months.split(",") if m.strip()]
-            months_list = [m for m in months_list if 1 <= m <= 12]
-
-            if _artifacts is None or _stations is None:
-                yield evt("error", "Modelo não carregado. Reinicie o servidor.")
+            # Valida a entrada antes de qualquer cálculo
+            try:
+                months_list = [int(m.strip()) for m in months.split(",") if m.strip()]
+                req = RecommendRequest(station_code=station_code, crop=crop, months=months_list)
+            except (ValueError, ValidationError):
+                yield evt("error", "Meses inválidos: informe ao menos um mês entre 1 e 12.")
                 return
 
-            # ── 1. Início ────────────────────────────────────────────────────
-            yield evt("init", "Iniciando motor de análise climática...",
-                      "AgroClima ML Engine v1.0 · Random Forest")
-            await asyncio.sleep(0.5)
-
-            # ── 2. Estação ───────────────────────────────────────────────────
-            station = _stations[_stations["codigo"] == station_code]
-            if len(station) == 0:
-                yield evt("error", f"Estação {station_code} não encontrada no banco de dados.")
+            try:
+                result = build_recommendation(req)
+            except HTTPException as exc:
+                yield evt("error", str(exc.detail))
                 return
-            st = station.iloc[0]
-            alt = f"{float(st.get('alt', 0)):.0f}m altitude" if st.get("alt") else ""
-            lat_s = f"Lat {float(st.get('lat', 0)):.4f}° · Lon {float(st.get('lon', 0)):.4f}°"
-            yield evt("station",
-                      f"Estação encontrada: {st['nome']} ({station_code})",
-                      f"{st['uf']} · {alt} · {lat_s}")
-            await asyncio.sleep(0.5)
 
-            # ── 3. Registros históricos ──────────────────────────────────────
-            yield evt("loading", "Carregando séries históricas do INMET...",
-                      "Lendo arquivos de dados brutos")
-            await asyncio.sleep(0.7)
+            st = _stations[_stations["codigo"] == station_code].iloc[0]
+            crop_info = CROP_REQUIREMENTS[crop]
 
-            monthly_data = _monthly[_monthly["codigo"] == station_code] if _monthly is not None else pd.DataFrame()
-            n_records = len(monthly_data)
+            yield evt("init", "Motor de análise climática AgroClima 1.1",
+                      "Regra trapezoidal aplicada diretamente sobre indicadores pré-processados")
+            yield evt("station", f"Estação encontrada: {st['nome']} ({station_code})",
+                      f"{st['uf']} · {float(st.get('alt', 0)):.0f} m · "
+                      f"Lat {float(st['lat']):.4f}° · Lon {float(st['lon']):.4f}°")
+            yield evt("records", "Indicadores mensais históricos carregados (em memória)",
+                      f"Período da estação: {result.periodo_dados}")
 
-            if n_records > 0:
-                years_sorted = sorted(monthly_data["year"].unique())
-                year_min, year_max = years_sorted[0], years_sorted[-1]
-                n_years = len(years_sorted)
-                yield evt("records",
-                          f"{n_records:,} registros mensais encontrados",
-                          f"Período: Jan/{year_min} a Dez/{year_max} · {n_years} anos de dados")
-            else:
-                yield evt("records",
-                          "Usando normais climáticas regionais",
-                          f"Estação {station_code} · dados interpolados por UF")
-            await asyncio.sleep(0.6)
+            t_req, p_req, u_req = crop_info["temp"], crop_info["precip"], crop_info["umidade"]
+            yield evt("crop", f"Requisitos agronômicos: {crop_info['nome']} {crop_info['emoji']}",
+                      f"Temp ótima {t_req[1]}-{t_req[2]} °C · Precip ótima {p_req[1]}-{p_req[2]} mm/mês · "
+                      f"Umidade ótima {u_req[1]}-{u_req[2]}%")
 
-            # ── 4. Normais climáticas ────────────────────────────────────────
-            yield evt("normals_calc", "Calculando normais climáticas mensais...",
-                      "Agregando médias históricas de temperatura, precipitação e umidade")
-            await asyncio.sleep(0.8)
-
-            norms = _normals[_normals["codigo"] == station_code] if _normals is not None else pd.DataFrame()
-            if len(norms) > 0:
-                temp_avg   = norms["temp_norm"].mean()
-                precip_sum = norms["precip_norm"].sum()
-                umid_avg   = norms["umidade_norm"].mean()
-                temp_amp   = norms["temp_norm"].max() - norms["temp_norm"].min()
-                yield evt("normals_done",
-                          f"Normais climáticas calculadas para {len(norms)} meses",
-                          f"Temp média anual: {temp_avg:.1f}°C (amp. {temp_amp:.1f}°C) · "
-                          f"Precip: {precip_sum:.0f}mm/ano · Umidade: {umid_avg:.1f}%")
-            else:
-                yield evt("normals_done", "Normais climáticas calculadas", "Dados regionais aplicados")
-            await asyncio.sleep(0.5)
-
-            # ── 5. Requisitos da cultura ─────────────────────────────────────
-            crop_reqs = _artifacts["crop_requirements"]
-            if crop not in crop_reqs:
-                yield evt("error", f"Cultura '{crop}' não reconhecida.")
-                return
-            crop_info = crop_reqs[crop]
-            yield evt("crop",
-                      f"Carregando requisitos agronômicos: {crop_info['nome']} {crop_info['emoji']}",
-                      crop_info["desc"])
-            await asyncio.sleep(0.5)
-
-            t_req = crop_info["temp"]
-            p_req = crop_info["precip"]
-            u_req = crop_info["umidade"]
-            yield evt("crop_req",
-                      "Faixas climáticas ideais definidas",
-                      f"Temp: {t_req[1]}-{t_req[2]}°C · "
-                      f"Precip: {p_req[1]}-{p_req[2]}mm/mês · "
-                      f"Umidade: {u_req[1]}-{u_req[2]}%")
-            await asyncio.sleep(0.5)
-
-            # ── 6. Random Forest ─────────────────────────────────────────────
-            model = _artifacts["model"]
-            n_trees = model.n_estimators
-            yield evt("ml_init",
-                      f"Inicializando Random Forest ({n_trees} árvores de decisão)...",
-                      "Carregando modelo pré-treinado com scikit-learn")
-            await asyncio.sleep(0.7)
-
-            yield evt("ml_features",
-                      "Extraindo features climáticas para o modelo...",
-                      "lat, lon, mês, temperatura, precipitação, umidade, desvio padrão, n_anos")
-            await asyncio.sleep(0.6)
-
-            # ── 7. Score por mês ─────────────────────────────────────────────
-            month_results = []
-            for m in sorted(set(months_list)):
-                score   = predict_score(st, m, crop)
-                climate = get_climate_for_month(station_code, m)
-                month_results.append((m, score, climate))
-
-                bar_filled = round(score / 10)
+            for md in result.months:
+                if md.score is None:
+                    yield evt("rule_month", f"{md.month_name}: sem dados", "Mês não pontuado",
+                              {"month": md.month, "score": None})
+                    continue
+                bar_filled = round(md.score / 10)
                 bar = "█" * bar_filled + "░" * (10 - bar_filled)
-                yield evt("ml_month",
-                          f"{MONTH_NAMES[m]}: viabilidade = {score:.1f}%  [{bar}]",
-                          f"Temp: {climate.get('temp_media', 0):.1f}°C · "
-                          f"Precip: {climate.get('precip_total', 0):.0f}mm · "
-                          f"Umidade: {climate.get('umidade_media', 0):.0f}%",
-                          {"month": m, "score": score})
-                await asyncio.sleep(0.65)
+                marca = "  ⚠ inviável" if md.status == "inviavel" else ""
+                yield evt("rule_month", f"{md.month_name}: {fmt(md.score)} pontos [{bar}]{marca}",
+                          md.details["formula"], {"month": md.month, "score": md.score})
+                await asyncio.sleep(0)
 
-            # ── 8. Score geral ───────────────────────────────────────────────
-            yield evt("scoring", "Calculando score de viabilidade geral...",
-                      "Ponderando temperatura (35%), precipitação (40%) e umidade (25%)")
-            await asyncio.sleep(0.5)
-
-            overall = float(np.mean([s for _, s, _ in month_results]))
-            verdict, color = score_to_verdict(overall)
             elapsed = time.time() - t0
-
             yield evt("complete",
-                      f"Análise concluída em {elapsed:.1f}s — Score: {overall:.1f}%",
-                      f"Classificação: {verdict} · Baseado em dados históricos do INMET",
-                      {"overall_score": overall, "verdict": verdict, "color": color})
-            await asyncio.sleep(0.4)
+                      f"Análise concluída em {elapsed * 1000:.0f} ms — {fmt(result.overall_score)} pontos (0-100)",
+                      f"Classificação: {result.verdict} · média dos meses pontuados (inviável conta 0)",
+                      {"overall_score": result.overall_score, "verdict": result.verdict,
+                       "color": result.verdict_color})
 
-            # ── 9. Resultado completo ────────────────────────────────────────
-            full = await recommend(RecommendRequest(
-                station_code=station_code, crop=crop, months=months_list
-            ))
-            yield f"data: {json.dumps({'step': 'result', 'result': full.model_dump()}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'step': 'result', 'result': result.model_dump()}, ensure_ascii=False)}\n\n"
 
         except Exception as exc:
             yield evt("error", f"Erro interno: {str(exc)}", "Verifique o console do servidor")

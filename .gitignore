@@ -13,3 +13,6 @@ __pycache__/
 # IDEs
 .vscode/
 .idea/
+
+# Arquivos grandes locais
+tcc.rar
